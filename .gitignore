@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Локальные настройки запуска (создаются игрой под конкретный ПК)
+video_settings.json
+
+# Служебные папки редактора и инструментов разработки
+.vscode/
+.freebuff/
+.cloud-attachments/
+
+# Черновики и скриншоты разработки
+shots/
+frame_m*.png

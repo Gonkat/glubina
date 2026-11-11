@@ -11,6 +11,26 @@ video_settings.json
 .freebuff/
 .cloud-attachments/
 
-# Черновики и скриншоты разработки
+# Черновики, скриншоты и документация разработки
 shots/
+docs/
 frame_m*.png
+/*.png
+*.docx
+*.pptx
+*.zip
+
+# Тесты и инструменты разработки не входят в runtime-репозиторий
+/test_*.py
+assets_gen.py
+assets/ASSETS_README.md
+assets/ASSET_STATUS.md
+assets/sprites/custom/README.txt
+
+# Старые проектные документы
+ARSENAL.md
+CANNON_TREE.md
+GRAPHICS.md
+PISTOL_TREE_V3.md
+SKILL_MASTERY.md
+SKILL_TREE_V2.md

@@ -57,7 +57,9 @@ class Drop(GameObject):
         if self.pickup_delay > 0.0:
             self.pickup_delay -= dt
             return
-        player = game.player
+        # Предмет подбирает БЛИЖАЙШИЙ живой игрок: один предмет не может
+        # достаться двоим, а бросок «к первому игроку» создавал бы спор.
+        player = game.nearest_player(self.x, self.y)
         dist = distance(self.x, self.y, player.x, player.y)
 
         if dist < self.pickup_range:            # примагничивание
@@ -70,13 +72,13 @@ class Drop(GameObject):
             dist = distance(self.x, self.y, player.x, player.y)
 
         if dist < player.radius + 12:           # подбор
-            if self.apply(game):
+            if self.apply(game, player):
                 self.kill()
 
         # покачивание при отрисовке (запоминаем здесь, draw не знает про время)
         self.lift = math.sin(game.elapsed * 5.0 + self.bob_phase) * self.wobble
 
-    def apply(self, game):
+    def apply(self, game, player):
         """Что даёт предмет. True — предмет потрачен/подобран."""
         raise NotImplementedError(
             f"{type(self).__name__} должен реализовать apply()"
@@ -93,8 +95,8 @@ class CoinDrop(Drop):
         super().__init__(x, y)
         self.value = value
 
-    def apply(self, game):
-        game.money += self.value
+    def apply(self, game, player):
+        player.money += self.value
         game.effects.append(FloatingText(self.x, self.y - 8, f"+{self.value}",
                                          (255, 212, 105), 17, 44.0))
         soundbank.play("coin")
@@ -111,8 +113,8 @@ class AmmoDrop(Drop):
         super().__init__(x, y)
         self.amount = amount
 
-    def apply(self, game):
-        game.player.equipment.add_ammo(self.amount)
+    def apply(self, game, player):
+        player.equipment.add_ammo(self.amount)
         game.effects.append(FloatingText(self.x, self.y - 8, f"+{self.amount} патр.",
                                          (210, 226, 246), 15, 44.0))
         soundbank.play("pickup")
@@ -129,8 +131,8 @@ class GrenadeDrop(Drop):
         super().__init__(x, y)
         self.amount = amount
 
-    def apply(self, game):
-        game.player.equipment.add_item("grenade", self.amount)
+    def apply(self, game, player):
+        player.equipment.add_item("grenade", self.amount)
         soundbank.play("pickup")
         return True
 
@@ -145,8 +147,8 @@ class HealDrop(Drop):
         super().__init__(x, y)
         self.amount = amount
 
-    def apply(self, game):
-        game.player.equipment.add_item("medkit", self.amount)
+    def apply(self, game, player):
+        player.equipment.add_item("medkit", self.amount)
         soundbank.play("pickup")
         return True
 
@@ -165,13 +167,12 @@ class ArtifactDrop(Drop):
         super().__init__(x, y)
         self.artifact_key = artifact_key
 
-    def apply(self, game):
-        player = game.player
+    def apply(self, game, player):
         artifact = create_artifact(self.artifact_key)
         old = player.equipment.get(artifact.slot)
         if old is not None:
             old.on_unequip(player)            # снять статы старого
-            game.money += old.refund_value()  # и вернуть % вложенного
+            player.money += old.refund_value()  # и вернуть % вложенного
         player.equipment.equip(artifact.slot, artifact)
         artifact.on_equip(player)             # включить статы нового
         soundbank.play("artifact")

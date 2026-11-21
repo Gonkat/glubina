@@ -40,6 +40,16 @@ class Player(GameObject):
         self.hp = PLAYER_MAX_HP
         self.max_hp = PLAYER_MAX_HP
 
+        # --- сеть и кооп: стабильный pid, личные деньги/очки/убийства ---
+        # В одиночной игре это просто поля одного героя; в кооперативе
+        # именно они делают развитие каждого участника отдельным.
+        self.pid = 0
+        self.name = "Игрок"
+        self.is_local = False
+        self.money = 0
+        self.score = 0
+        self.kills = 0
+
         # --- усиления сектора (M12): живут до конца вылазки ---
         self.boons = []                 # выбранные карты (для интерфейса)
         self.boon_damage_mult = 1.0
@@ -184,6 +194,43 @@ class Player(GameObject):
                        color=weapon.mode_color)
         return True
 
+    def lose_half_skills(self):
+        """Плата за воскрешение: сгорает половина купленных навыков.
+
+        Первыми теряются самые глубокие узлы (высокий tier), база
+        остаётся: после возвращения герой не превращается в пустышку.
+        Бонусы снимаются в обратную сторону — умножение делится,
+        сложение вычитается, — поэтому агрегаты skill_mods совпадают
+        с состоянием «этих узлов никогда не было».
+        Возвращает число потерянных узлов.
+        """
+        if not self.skill_nodes:
+            return 0
+        import skill_tree
+
+        def depth(node_id):
+            _, node = skill_tree.find_player_node(node_id)
+            return (int(node.get("tier", 0)) if node else 0, node_id)
+
+        ordered = sorted(self.skill_nodes, key=depth, reverse=True)
+        removed = ordered[:len(ordered) // 2]
+        for node_id in removed:
+            _, node = skill_tree.find_player_node(node_id)
+            self.skill_nodes.discard(node_id)
+            if node is None:
+                continue
+            for key, value in node.get("mods", {}).items():
+                if key.endswith("_mul"):
+                    current = self.skill_mods.get(key, 1.0)
+                    self.skill_mods[key] = current / value if value else current
+                else:
+                    self.skill_mods[key] = self.skill_mods.get(key, 0.0) - value
+                if key == "hp_add":
+                    self.max_hp = max(1.0, self.max_hp - value)
+        self.hp = min(self.hp, self.max_hp)
+        self.refresh_speed()
+        return len(removed)
+
     # ------------------------------------------------------------ ДРЕВО ГЕРОЯ
     def skill_mod(self, name, default=0.0):
         """Значение общего навыка героя (0/1 — если узел не куплен)."""
@@ -305,6 +352,8 @@ class Player(GameObject):
                 self._update_charged_weapon(dt, game, weapon)
             elif self.trigger_held:
                 self.try_attack(game)
+            elif getattr(weapon, "uses_disc", False):
+                self._firearm_trigger_was_held = False
         else:
             self._firearm_trigger_was_held = False
 
@@ -456,13 +505,15 @@ class Player(GameObject):
         for shot_angle in weapon.shot_angles(self.angle, (pellets, spread_deg)):
             mx = self.x + math.cos(shot_angle) * weapon.muzzle_offset
             my = self.y + math.sin(shot_angle) * weapon.muzzle_offset
-            game.bullets.append(Bullet(mx, my, shot_angle, **shot))
+            charged_bullet = Bullet(mx, my, shot_angle, **shot)
+            charged_bullet.owner = self
+            game.bullets.append(charged_bullet)
         fx = self.x + math.cos(self.angle) * weapon.muzzle_offset
         fy = self.y + math.sin(self.angle) * weapon.muzzle_offset
         game.effects.append(MuzzleFlash(
             fx, fy, self.angle,
             color=weapon.charge_color))
-        game.on_shot(weapon)
+        game.on_shot(weapon, self)
         soundbank.play(weapon.mode_profile.get(
             "charge_sound", weapon.spec.get("charge_sound", "sniper")),
                        0.55 + 0.35 * ratio)
@@ -490,10 +541,14 @@ class Player(GameObject):
             return
         # Магнитный диск: пока снаряд в полёте, ЛКМ возвращает его, а не
         # тратит второй патрон. Это и есть «управление траекторией».
-        if getattr(weapon, "uses_disc", False) and weapon.has_live_disc:
-            if weapon.recall_discs():
-                soundbank.play("lightning", 0.22)
-            return
+        if getattr(weapon, "uses_disc", False):
+            if self._firearm_trigger_was_held:
+                return
+            if weapon.has_live_disc:
+                if weapon.recall_discs():
+                    soundbank.play("lightning", 0.22)
+                self._firearm_trigger_was_held = True
+                return
         # Режимы с ценой 2-3 патрона не должны «заклинивать» на остатке 1.
         if weapon.loaded < weapon.rounds_per_shot and not weapon.is_reloading:
             self.start_reload()      # авто-перезарядка при пустом магазине
@@ -513,9 +568,11 @@ class Player(GameObject):
             mx = self.x + math.cos(shot_angle) * weapon.muzzle_offset
             my = self.y + math.sin(shot_angle) * weapon.muzzle_offset
             bullet = Bullet(mx, my, shot_angle, **shot)
+            bullet.owner = self      # кому засчитать убийство/урон
             game.bullets.append(bullet)
             if getattr(weapon, "uses_disc", False):
                 weapon.track_disc(bullet)
+                self._firearm_trigger_was_held = True
         # «Залп»: каждый N-й спуск выпускает дополнительные пули веером.
         # Патроны они не тратят, но и урона получают меньше (см. данные).
         if weapon.volley_ready:
@@ -526,13 +583,15 @@ class Player(GameObject):
                 shot_angle = self.angle + random.uniform(-spread / 2, spread / 2)
                 mx = self.x + math.cos(shot_angle) * weapon.muzzle_offset
                 my = self.y + math.sin(shot_angle) * weapon.muzzle_offset
-                game.bullets.append(Bullet(mx, my, shot_angle, **extra))
+                extra_bullet = Bullet(mx, my, shot_angle, **extra)
+                extra_bullet.owner = self
+                game.bullets.append(extra_bullet)
             weapon.volley_ready = False
         # одна вспышка на выстрел (пуль может быть много)
         fx = self.x + math.cos(self.angle) * weapon.muzzle_offset
         fy = self.y + math.sin(self.angle) * weapon.muzzle_offset
         game.effects.append(MuzzleFlash(fx, fy, self.angle))
-        game.on_shot(weapon)
+        game.on_shot(weapon, self)
         # звук выстрела выбирается ДАННЫМИ оружия и режима (weapon_data)
         soundbank.play(weapon.mode_profile.get(
             "sound", weapon.spec.get("sound", "shoot")))
@@ -572,7 +631,7 @@ class Player(GameObject):
         game.explode(self.x, self.y, weapon.vent_radius(),
                      weapon.vent_blast(),
                      float(weapon.spec.get("vent_knockback", 200.0)),
-                     hurt_player=False,
+                     hurt_player=False, source=self,
                      slow=float(weapon.mod("vent_slow", 0.0)),
                      color=(255, 140, 96))
         # Сброс вредит и самому герою: это и есть риск горячей очереди.
@@ -598,7 +657,9 @@ class Player(GameObject):
     def throw_grenade(self, game):
         """Бросок гранаты (Q). Подсказка вместо тишины, если гранат нет."""
         if self.equipment.use_item("grenade"):
-            game.grenades.append(Grenade(self.x, self.y, self.angle))
+            grenade = Grenade(self.x, self.y, self.angle)
+            grenade.owner = self
+            game.grenades.append(grenade)
             soundbank.play("throw")
         else:
             soundbank.play("error", 0.4)
@@ -674,14 +735,14 @@ class Player(GameObject):
         self.hurt_timer = 0.35
         soundbank.play("hurt")
         if game is not None:
-            game.on_player_hurt(amount)
+            game.on_player_hurt(amount, self)
             if (melee is not None and melee.mod("retaliate_damage", 0.0)
                     and self.retaliate_cd <= 0.0):
                 self.retaliate_cd = melee.mod("retaliate_cd", 2.5)
                 game.explode(self.x, self.y,
                              melee.mod("retaliate_radius", 90.0),
                              melee.mod("retaliate_damage", 35.0),
-                             160.0, hurt_player=False)
+                             160.0, hurt_player=False, source=self)
         if self.hp <= 0:
             # артефакт может спасти («Сердце титана», M7) — тогда живём
             if artifact is not None and artifact.on_fatal(self, amount):
@@ -693,7 +754,7 @@ class Player(GameObject):
                 self.hp = 0
                 self.cancel_charge()   # смерть не должна стрелять за игрока
                 if game is not None:
-                    game.on_player_death()
+                    game.on_player_death(self)
                 self.kill()
 
     # ------------------------------------------------------------ ОТРИСОВКА

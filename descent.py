@@ -16,6 +16,7 @@ import random
 import pygame
 
 import soundbank
+import spritebank
 import visuals
 from settings import (
     BEACON_COUNT,
@@ -28,7 +29,7 @@ from settings import (
     BEACON_SURGE_INTERVAL,
     LIFT_INTERACT_RANGE,
 )
-from utils import distance
+from utils import distance, fade_draw
 from weapon_data import TOKEN_KEYS, TOKEN_NAMES
 
 
@@ -234,8 +235,9 @@ class Beacon:
         self.state = "charging"
         self.progress = 0.0
         self.surge_timer = BEACON_SURGE_INTERVAL
-        player = game.player
-        self.linked = distance(self.x, self.y, player.x, player.y) <= BEACON_LINK_RANGE
+        # Маяк — ОБЩАЯ цель: его запускает и удерживает любой живой игрок.
+        self.linked = game.player_within(
+            self.x, self.y, BEACON_LINK_RANGE) is not None
         game.spawn_beacon_surge(self, count=2)
         soundbank.play("beacon_start", 0.8)
         game.toast(f"{self.label()}: удерживайте позицию {int(BEACON_DEFENSE_TIME)} с",
@@ -246,8 +248,8 @@ class Beacon:
         self.pulse += dt
         if self.state != "charging":
             return
-        player = game.player
-        self.linked = distance(self.x, self.y, player.x, player.y) <= BEACON_LINK_RANGE
+        self.linked = game.player_within(
+            self.x, self.y, BEACON_LINK_RANGE) is not None
         if not self.linked:
             return
         self.progress = min(1.0, self.progress + dt / BEACON_DEFENSE_TIME)
@@ -265,15 +267,23 @@ class Beacon:
         depth = getattr(game, "depth", 1)
         money = int(BEACON_REWARD_MONEY * (1 + 0.2 * (depth - 1)))
         ammo = BEACON_REWARD_AMMO + (depth - 1) * 5
-        game.money += money
-        game.player.equipment.add_ammo(ammo)
-        game.player.heal(12)
+        # Награда общая: маяк — цель сектора, а не личный трофей хоста.
+        # Деньги и патроны при этом остаются ПЕРСОНАЛЬНЫМИ: каждый
+        # получает свою долю, никто не тратит чужое.
         token_names = []
         reward_count = min(BEACON_REWARD_TOKEN, len(TOKEN_KEYS))
-        for key in random.sample(TOKEN_KEYS, reward_count):
-            game.player.add_weapon_token(key, 1)
+        token_keys = random.sample(TOKEN_KEYS, reward_count)
+        for player in game.players:
+            if not player.alive:
+                continue
+            player.money += money
+            player.equipment.add_ammo(ammo)
+            player.heal(12)
+            player.score += 250 * depth
+            for key in token_keys:
+                player.add_weapon_token(key, 1)
+        for key in token_keys:
             token_names.append(TOKEN_NAMES[key])
-        game.score += 250 * depth
         game.camera.add_shake(6.0)
         soundbank.play("beacon_done", 0.85)
         token_note = ""
@@ -297,6 +307,11 @@ class Beacon:
                 and -120 < sy < screen.get_height() + 90):
             return
         sx, sy = int(sx), int(sy)
+        beacon_sprite = spritebank.get_scaled("object/beacon", (120, 150))
+        if beacon_sprite is not None:
+            screen.blit(beacon_sprite,
+                        beacon_sprite.get_rect(midbottom=(sx, sy + 14)))
+            return
         visuals.shadow(screen, sx, sy + 12, 28, 0.9)
         # основание
         pygame.draw.ellipse(screen, (20, 26, 34), (sx - 30, sy - 2, 60, 22))
@@ -316,8 +331,10 @@ class Beacon:
         pygame.draw.circle(screen, (22, 28, 36), (sx, sy - 74), 8)
         pygame.draw.circle(screen, self.color, (sx, sy - 74), 5)
 
-    def draw_overlay(self, screen, camera, elapsed, game):
+    def draw_overlay(self, screen, camera, elapsed, game, visible=None):
         if not game.camera.is_visible(self.x, self.y, 120):
+            return
+        if visible is not None and not visible(self.x, self.y):
             return
         sx, sy = camera.to_screen(self.x, self.y)
         sx, sy = int(sx), int(sy)
@@ -368,6 +385,87 @@ class Beacon:
                              align="center")
 
 
+# ------------------------------------------------------------------ АЛТАРЬ
+class Altar:
+    """Алтарь возвращения: осколок души с босса поднимает павшего.
+
+    Стоит в стартовой комнате сектора: соратникам не нужно таскать
+    тело через полкарты, а павший сам решает, ждать спуска или звать
+    на помощь. Один осколок — одно воскрешение.
+    """
+
+    radius = 28
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.pulse = 0.0
+
+    def activate(self, game, player=None):
+        player = game.player if player is None else player
+        fallen = [other for other in game.players if not other.alive]
+        if not fallen:
+            game.toast("Павших нет — алтарь молчит", 2.0,
+                       color=(150, 160, 190))
+            return True
+        if player.equipment.item_count("soul_shard") <= 0:
+            game.toast("Нужен осколок души — его роняет босс", 2.6,
+                       color=(240, 190, 110))
+            return True
+        target = min(fallen, key=lambda other: (
+            distance(other.x, other.y, self.x, self.y), other.pid))
+        player.equipment.use_item("soul_shard")
+        game.revive_player(target, self.x, self.y + 46)
+        return True
+
+    # ---------------------------------------------------------- РИСОВАНИЕ
+    def draw(self, screen, camera, elapsed):
+        sx, sy = camera.to_screen(self.x, self.y)
+        if not (-90 < sx < screen.get_width() + 90
+                and -90 < sy < screen.get_height() + 90):
+            return
+        sx, sy = int(sx), int(sy)
+        altar_sprite = spritebank.get_scaled("object/altar", (96, 88))
+        if altar_sprite is not None:
+            screen.blit(altar_sprite,
+                        altar_sprite.get_rect(midbottom=(sx, sy + 18)))
+            return
+        visuals.shadow(screen, sx, sy + 12, 42, 0.95)
+        pygame.draw.ellipse(screen, (18, 19, 28), (sx - 38, sy - 4, 76, 28))
+        pygame.draw.ellipse(screen, (70, 58, 96), (sx - 36, sy - 7, 72, 28), 2)
+        pygame.draw.rect(screen, (26, 26, 40), (sx - 26, sy - 26, 52, 20),
+                         border_radius=4)
+        pygame.draw.rect(screen, (92, 76, 132), (sx - 26, sy - 26, 52, 20),
+                         2, border_radius=4)
+        # три свечи-кристалла: видно, что алтарь живой, а не декорация
+        for i in range(3):
+            cx = sx - 15 + i * 15
+            top = sy - 30 - (10 + i * 4)
+            pygame.draw.line(screen, (126, 102, 176), (cx, sy - 28),
+                             (cx, top), 2)
+            pygame.draw.circle(screen, (196, 150, 255), (cx, top - 2), 3)
+
+    def draw_overlay(self, screen, camera, elapsed, game, visible=None):
+        if visible is not None and visible(self.x, self.y) <= 0.01:
+            return
+        sx, sy = camera.to_screen(self.x, self.y)
+        sx, sy = int(sx), int(sy)
+        pulse = 0.7 + 0.3 * math.sin(elapsed * 2.6 + self.pulse)
+        fallen = sum(1 for other in game.players if not other.alive)
+        color = (198, 156, 255) if fallen else (126, 116, 152)
+        _draw_cone(screen, sx, sy - 20, 120 if fallen else 74, 16, color,
+                   86 if fallen else 30, pulse)
+        visuals.glow(screen, sx, sy - 30, 40, color, 84 if fallen else 30)
+        visuals.draw_ring(screen, sx, sy + 8, 34, color, 2,
+                          int(90 + 80 * pulse))
+        if distance(game.player.x, game.player.y, self.x, self.y) >= 140:
+            label = "АЛТАРЬ ВОЗВРАЩЕНИЯ"
+            if fallen:
+                label += f" · павших {fallen}"
+            visuals.text(screen, label, (sx, sy + 34), 15, color,
+                         align="center")
+
+
 # ------------------------------------------------------------------ ЛИФТ
 class Lift:
     radius = 26
@@ -385,6 +483,11 @@ class Lift:
                 and -100 < sy < screen.get_height() + 100):
             return
         sx, sy = int(sx), int(sy)
+        lift_sprite = spritebank.get_scaled("object/lift", (136, 116))
+        if lift_sprite is not None:
+            screen.blit(lift_sprite,
+                        lift_sprite.get_rect(midbottom=(sx, sy + 16)))
+            return
         visuals.shadow(screen, sx, sy + 8, 42, 1.0)
         points = []
         for i in range(8):
@@ -401,8 +504,10 @@ class Lift:
                 pygame.draw.line(screen, (82, 210, 190),
                                  (sx - 9, yy), (sx + 9, yy), 2)
 
-    def draw_overlay(self, screen, camera, elapsed, game):
+    def draw_overlay(self, screen, camera, elapsed, game, visible=None):
         if not game.camera.is_visible(self.x, self.y, 120):
+            return
+        if visible is not None and not visible(self.x, self.y):
             return
         sx, sy = camera.to_screen(self.x, self.y)
         sx, sy = int(sx), int(sy)
@@ -433,6 +538,7 @@ class DescentManager:
         self.depth = depth
         self.beacons = []
         self.lift = None
+        self.altar = None
         self._place(game, depth)
         self.notice_timer = 0.0
 
@@ -508,6 +614,24 @@ class DescentManager:
                     last.x, last.y + 92, 34)
         self.lift = Lift(lift_x, lift_y, depth + 1)
 
+        # Алтарь возвращения — в стартовой комнате. Позиция выбирается
+        # без random, чтобы хост и клиент (тот же seed) ставили его
+        # в одну и ту же точку.
+        spot = None
+        for offset in (110.0, 150.0, 90.0):
+            for step in range(8):
+                angle = step * math.tau / 8
+                tx = start_x + math.cos(angle) * offset
+                ty = start_y + math.sin(angle) * offset
+                if world.is_valid_position(tx, ty, 34):
+                    spot = (tx, ty)
+                    break
+            if spot is not None:
+                break
+        if spot is None:
+            spot = world.resolve_circle(start_x + 96, start_y + 96, 34)
+        self.altar = Altar(*spot)
+
     # ---------------------------------------------------------- ЛОГИКА
     @property
     def active_count(self):
@@ -524,20 +648,31 @@ class DescentManager:
                 return beacon
         return None
 
+    def beacon_states(self):
+        """Состояние общих целей для сетевого снимка."""
+        return [{"index": b.index, "state": b.state,
+                 "progress": round(b.progress, 3)} for b in self.beacons]
+
     def update(self, dt, game):
+        if self.altar is not None:
+            self.altar.pulse += dt
         for beacon in self.beacons:
             beacon.update(dt, game)
         if self.lift is not None:
             self.lift.pulse += dt
             if self.all_active and not self.lift.open:
                 self.lift.open = True
-                game.score += 500 * self.depth
+                for player in game.players:
+                    player.score += 500 * self.depth
                 game.camera.add_shake(8.0)
                 soundbank.play("lift_open", 0.9)
         self._push_player(game)
 
     def _push_player(self, game):
-        player = game.player
+        for player in game.players:
+            self._push_one(game, player)
+
+    def _push_one(self, game, player):
         for obj in self.beacons + ([self.lift] if self.lift else []):
             radius = 30 if isinstance(obj, Beacon) else 34
             dx = player.x - obj.x
@@ -550,10 +685,15 @@ class DescentManager:
                 py = obj.y + dy / d * (radius + player.radius)
                 player.x, player.y = game.world.resolve_circle(px, py, player.radius)
 
-    def interact(self, game):
-        target = self.nearest_interactable(game)
+    def interact(self, game, player=None):
+        user = game.player if player is None else player
+        if not user.alive:
+            return False
+        target = self.nearest_interactable(game, player)
         if target is None:
             return False
+        if isinstance(target, Altar):
+            return target.activate(game, user)
         if isinstance(target, Beacon):
             return target.activate(game)
         if not target.open:
@@ -563,8 +703,8 @@ class DescentManager:
         game.descend_to_next()
         return True
 
-    def nearest_interactable(self, game):
-        player = game.player
+    def nearest_interactable(self, game, player=None):
+        player = game.player if player is None else player
         best = None
         best_d = 1e9
         for beacon in self.beacons:
@@ -578,6 +718,10 @@ class DescentManager:
             d = distance(self.lift.x, self.lift.y, player.x, player.y)
             if d <= LIFT_INTERACT_RANGE + self.lift.radius and d < best_d:
                 best, best_d = self.lift, d
+        if self.altar is not None:
+            d = distance(self.altar.x, self.altar.y, player.x, player.y)
+            if d <= 112 + self.altar.radius and d < best_d:
+                best, best_d = self.altar, d
         return best
 
     def compass_target(self):
@@ -609,6 +753,8 @@ class DescentManager:
             lights.append((beacon.x, beacon.y, radius, beacon.color))
         if self.lift is not None and self.lift.open:
             lights.append((self.lift.x, self.lift.y, 230, (88, 232, 204)))
+        if self.altar is not None:
+            lights.append((self.altar.x, self.altar.y, 160, (172, 132, 236)))
         return lights
 
     # ---------------------------------------------------------- РИСОВАНИЕ
@@ -617,9 +763,36 @@ class DescentManager:
             beacon.draw(screen, camera, elapsed)
         if self.lift is not None:
             self.lift.draw(screen, camera, elapsed)
+        if self.altar is not None:
+            self.altar.draw(screen, camera, elapsed)
 
-    def draw_overlay(self, screen, camera, elapsed, game):
+    def draw_overlay(self, screen, camera, elapsed, game, visible=None):
+        """
+        Метки маяков/лифта поверх темноты.
+
+        visible(x, y) возвращает прозрачность 0..1 — объект у края
+        света или уходящий за стену гаснет плавно (см. utils.fade_draw).
+        """
         for beacon in self.beacons:
-            beacon.draw_overlay(screen, camera, elapsed, game)
+            self._draw_site_overlay(screen, camera, elapsed, game,
+                                    visible, beacon)
         if self.lift is not None:
-            self.lift.draw_overlay(screen, camera, elapsed, game)
+            self._draw_site_overlay(screen, camera, elapsed, game,
+                                    visible, self.lift)
+        if self.altar is not None:
+            self._draw_site_overlay(screen, camera, elapsed, game,
+                                    visible, self.altar)
+
+    @staticmethod
+    def _draw_site_overlay(screen, camera, elapsed, game, visible, site):
+        """Оверлей одной точки (маяк/лифт) с плавной прозрачностью."""
+        a = 1.0 if visible is None else visible(site.x, site.y)
+        if a <= 0.01:
+            return
+        sx, sy = camera.to_screen(site.x, site.y)
+        fade_draw(
+            screen, sx, sy, a,
+            lambda: site.draw_overlay(screen, camera, elapsed, game,
+                                      visible=visible),
+            margin=130,
+        )

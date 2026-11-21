@@ -574,6 +574,13 @@ class MuzzleFlash(GameObject):
     def draw(self, screen, camera):
         x, y = camera.to_screen(self.x, self.y)
         t = max(0.0, self.life / self.life_time)
+        flash_sprite = spritebank.get_scaled("effects/muzzle_flash", (48, 48))
+        if flash_sprite is not None:
+            frame = pygame.transform.rotate(
+                flash_sprite, -math.degrees(self.angle)).copy()
+            frame.set_alpha(int(255 * t))
+            screen.blit(frame, frame.get_rect(center=(int(x), int(y))))
+            return
         # восьмиконечная звезда + кольцо: выстрел видно даже в тёмном коридоре
         points = []
         for i in range(16):
@@ -633,13 +640,16 @@ class Grenade(GameObject):
         self.vx = math.cos(angle) * GRENADE_SPEED
         self.vy = math.sin(angle) * GRENADE_SPEED
         self.fuse = GRENADE_FUSE
+        # Кто бросил: своя граната не бьёт своего, чужие — бьют всех.
+        self.owner = None
 
     def update(self, dt, game):
         self.fuse -= dt
         if self.fuse <= 0.0:
             self.kill()
             game.explode(self.x, self.y, GRENADE_RADIUS,
-                         GRENADE_DAMAGE, GRENADE_KNOCKBACK)
+                         GRENADE_DAMAGE, GRENADE_KNOCKBACK,
+                         source=self.owner)
             return
         if self.vx or self.vy:
             nx = self.x + self.vx * dt

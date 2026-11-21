@@ -5,9 +5,9 @@
   * все персонажи рисуются в одном месте и в одном стиле;
   * вид кэшируется по (тип, радиус, угол) — 60 врагов не перерисовываются
     десятками примитивов каждый кадр;
-  * исходные PNG в assets/sprites остаются нетронутыми: код рисует
-    собственные читаемые силуэты, а заменяемый спрайт-банк продолжает
-    работать для предметов и оружия.
+  * каждый силуэт можно заменить своим файлом: если в assets/sprites
+    лежит PNG по ключу типа (player, enemy, boss/warden), рисуется он,
+    а процедурное построение остаётся резервом на случай удалённого файла.
 
 Стиль: тёмный индустриальный мир, холодные бирюзовые тени и тёплый
 золотой свет игрока. Враги отличаются формой, а не только цветом.
@@ -15,6 +15,8 @@
 import math
 
 import pygame
+
+import spritebank
 
 # ------------------------------------------------------------------ ПАЛИТРА
 INK = (10, 13, 22)
@@ -124,7 +126,10 @@ def glow(screen, x, y, radius, color, alpha=110):
     Поверхность непрозрачная и чёрная снаружи: BLEND_RGB_ADD добавляет
     ровно столько света, сколько нужно, не заливая фон цветной кляксой.
     """
-    key = (max(4, int(radius)), tuple(color), int(alpha))
+    # Квантуем цвет (шаг 8): иначе мерцание ламп строит новую
+    # поверхность КАЖДЫЙ кадр — аллокации, паузы GC и рост кэша.
+    color = tuple((int(c) // 8) * 8 for c in color)
+    key = (max(4, int(radius)), color, int(alpha))
     surf = _GLOWS.get(key)
     if surf is None:
         surf = pygame.Surface((radius * 2, radius * 2))
@@ -135,6 +140,10 @@ def glow(screen, x, y, radius, color, alpha=110):
             strength = (1.0 - t) ** 1.8 * (alpha / 255.0)
             value = tuple(min(255, int(c * strength)) for c in color)
             pygame.draw.circle(surf, value, (radius, radius), max(1, int(radius * t)))
+        if len(_GLOWS) > 240:
+            # Вытесняем самую старую запись, а не весь кэш: полная
+            # очистка заставила бы пересобрать ореолы всех ламп разом.
+            _GLOWS.pop(next(iter(_GLOWS)), None)
         _GLOWS[key] = surf
     screen.blit(surf, (int(x - radius), int(y - radius)),
                 special_flags=pygame.BLEND_RGB_ADD)
@@ -454,6 +463,59 @@ def _build_overlord(surf, c, u):
     _ellipse(surf, (255, 120, 60), c, c, u, 0.74, 0.0, 0.12, 0.22)
 
 
+def _build_worm(surf, c, u):
+    # Голова гигантского червя: сегментированный панцирь и круглая пасть.
+    _ellipse(surf, (18, 14, 12), c, c, u, -0.18, 0.0, 1.12, 0.94)
+    _ellipse(surf, (146, 110, 70), c, c, u, -0.18, 0.0, 1.04, 0.86)
+    for dx, rr in ((-0.88, 0.50), (-0.52, 0.66), (-0.16, 0.78)):
+        _ellipse(surf, (96, 68, 42), c, c, u, dx, 0.0, rr, rr * 0.94)
+        _ellipse(surf, (168, 128, 84), c, c, u, dx - 0.04, -0.10,
+                 rr * 0.74, rr * 0.62)
+    # пасть
+    _circle(surf, (26, 12, 12), c, c, u, 0.52, 0.0, 0.64)
+    _circle(surf, (126, 34, 32), c, c, u, 0.52, 0.0, 0.53)
+    _circle(surf, (18, 8, 8), c, c, u, 0.52, 0.0, 0.34)
+    for i in range(10):
+        a = math.radians(i * 36)
+        _poly(surf, (238, 226, 196), c, c, u, [
+            (0.52 + math.cos(a) * 0.46, math.sin(a) * 0.46),
+            (0.52 + math.cos(a) * 0.20, math.sin(a) * 0.20),
+            (0.52 + math.cos(a + 0.17) * 0.36, math.sin(a + 0.17) * 0.36),
+        ])
+    # жвала
+    for side in (-1, 1):
+        _poly(surf, (52, 36, 26), c, c, u, [
+            (0.70, side * 0.56), (1.26, side * 0.32), (0.84, side * 0.14),
+        ])
+        _poly(surf, (200, 164, 112), c, c, u, [
+            (0.80, side * 0.52), (1.20, side * 0.34), (0.88, side * 0.24),
+        ])
+    # глаза
+    for side in (-1, 1):
+        _circle(surf, (30, 20, 14), c, c, u, 0.14, side * 0.54, 0.19)
+        _circle(surf, (255, 186, 72), c, c, u, 0.16, side * 0.54, 0.13)
+        _circle(surf, (255, 246, 196), c, c, u, 0.20, side * 0.54, 0.05)
+
+
+def _build_worm_segment(surf, c, u):
+    """Кольцо тела червя; игра укладывает их цепочкой за головой."""
+    _circle(surf, (18, 14, 12), c, c, u, 0.0, 0.0, 1.02)
+    _circle(surf, (146, 110, 70), c, c, u, 0.0, 0.0, 0.94)
+    _circle(surf, (108, 78, 48), c, c, u, 0.0, 0.0, 0.70)
+    _circle(surf, (172, 134, 90), c, c, u, -0.10, -0.12, 0.46)
+    for i in range(8):
+        a = math.radians(i * 45)
+        _circle(surf, (64, 46, 30), c, c, u,
+                math.cos(a) * 0.92, math.sin(a) * 0.92, 0.09)
+    for side in (-1, 1):
+        _poly(surf, (58, 42, 28), c, c, u, [
+            (0.10, side * 0.80), (0.52, side * 1.16), (0.44, side * 0.70),
+        ])
+        _poly(surf, (58, 42, 28), c, c, u, [
+            (-0.42, side * 0.82), (-0.78, side * 1.12), (-0.16, side * 0.88),
+        ])
+
+
 _BUILDERS = {
     "player": _build_player,
     "enemy": _build_crawler,
@@ -466,7 +528,32 @@ _BUILDERS = {
     "boss/warden": _build_warden,
     "boss/reaper": _build_reaper,
     "boss/overlord": _build_overlord,
+    "boss/worm": _build_worm,
+    "boss/worm_segment": _build_worm_segment,
 }
+
+
+def _asset_sprite(kind, size):
+    """PNG из assets/sprites по ключу kind, вписанный в квадрат size.
+
+    Возвращает None, если файла нет или картинка битая — тогда вызывающий
+    код рисует процедурный силуэт, как раньше.
+    """
+    try:
+        base = spritebank.try_get(kind)
+    except (pygame.error, OSError, ValueError):
+        return None
+    if base is None:
+        return None
+    width, height = base.get_size()
+    if width <= 0 or height <= 0:
+        return None
+    factor = min(size / width, size / height)
+    scaled = pygame.transform.smoothscale(
+        base, (max(1, int(width * factor)), max(1, int(height * factor))))
+    canvas = pygame.Surface((size, size), pygame.SRCALPHA)
+    canvas.blit(scaled, scaled.get_rect(center=(size // 2, size // 2)))
+    return canvas
 
 
 def base_sprite(kind, radius):
@@ -476,13 +563,15 @@ def base_sprite(kind, radius):
     cached = _CHAR_CACHE.get(key)
     if cached is not None:
         return cached
-    builder = _BUILDERS.get(kind, _build_crawler)
     final = max(40, int(radius * 4.2))
-    scale = 3
-    surf = pygame.Surface((final * scale, final * scale), pygame.SRCALPHA)
-    c = surf.get_width() / 2
-    builder(surf, c, radius * scale)
-    surf = pygame.transform.smoothscale(surf, (final, final))
+    surf = _asset_sprite(kind, final)
+    if surf is None:
+        builder = _BUILDERS.get(kind, _build_crawler)
+        scale = 3
+        surf = pygame.Surface((final * scale, final * scale), pygame.SRCALPHA)
+        c = surf.get_width() / 2
+        builder(surf, c, radius * scale)
+        surf = pygame.transform.smoothscale(surf, (final, final))
     if len(_CHAR_CACHE) > 24:
         _CHAR_CACHE.clear()
     _CHAR_CACHE[key] = surf
@@ -501,6 +590,12 @@ def character(kind, radius, angle):
             _ROT_CACHE.clear()
         _ROT_CACHE[key] = cached
     return cached
+
+
+def reload_assets():
+    """Сбросить кэш силуэтов после перечитывания PNG (F5 в игре)."""
+    _CHAR_CACHE.clear()
+    _ROT_CACHE.clear()
 
 
 def draw_hit_flash(screen, sx, sy, radius, alpha):

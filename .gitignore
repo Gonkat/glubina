@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Сетевой сервер: зависимости ставятся локально
+server/node_modules/
+
 # Локальные настройки запуска (создаются игрой под конкретный ПК)
 video_settings.json
 

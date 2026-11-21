@@ -45,9 +45,14 @@ class Shop(GameObject):
     def update(self, dt, game):
         self.time += dt
 
-    def near_player(self, game):
-        """Достаточно ли герой близко, чтобы открыть магазин (клавиша E)."""
-        return distance(self.x, self.y, game.player.x, game.player.y) < SHOP_OPEN_DIST
+    def near_player(self, game, player=None):
+        """Достаточно ли герой близко, чтобы открыть магазин (клавиша E).
+
+        В кооперативе магазин открывает ЛЮБОЙ участник, который подошёл:
+        проверка идёт по конкретному игроку, а не по «первому в списке».
+        """
+        player = game.player if player is None else player
+        return distance(self.x, self.y, player.x, player.y) < SHOP_OPEN_DIST
 
     def push_out(self, obj):
         """

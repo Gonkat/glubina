@@ -55,6 +55,9 @@ class Enemy(GameObject):
     )
 
     sprite_name = "enemy"      # файл assets/sprites/{name}.png (M8)
+    # Полуразмер зоны fade_draw/is_visible: должен покрывать всё тело.
+    # Длинные враги (босс-червь) переопределяют это значение.
+    fade_margin = 140
 
     def __init__(self, x, y):
         super().__init__(x, y)
@@ -93,7 +96,9 @@ class Enemy(GameObject):
         self.kb_vy += direction[1] * force
 
     def update(self, dt, game):
-        player = game.player
+        # Цель — ближайший живой игрок (предсказуемо, с tie-break по pid):
+        # порядок обновления списка игроков не должен «дёргать» врагов.
+        player = game.nearest_player(self.x, self.y)
         self.angle = math.atan2(player.y - self.y, player.x - self.x)
 
         # отбрасывание: импульс гаснет экспоненциально, враг врезается в стены
@@ -164,7 +169,7 @@ class Enemy(GameObject):
 
         Пока идём по пути, каждая достигнутая точка снимается со списка.
         """
-        player = game.player
+        player = game.nearest_player(self.x, self.y)
         self.path_timer -= dt
         if self.path_timer <= 0.0:
             self.path_timer = self.repath_interval
@@ -225,6 +230,10 @@ class Enemy(GameObject):
             push = (min_d - d) * 0.5
             self.x += dx / d * push
             self.y += dy / d * push
+
+    def hit_test(self, x, y, radius):
+        """Попадание точки/круга в тело врага (по умолчанию — один круг)."""
+        return circles_collide(x, y, radius, self.x, self.y, self.radius)
 
     def take_damage(self, amount):
         self.hp -= amount
@@ -402,7 +411,8 @@ class Bomber(Enemy):
         super().update(dt, game)
         if not self.alive:
             return
-        dist = distance(self.x, self.y, game.player.x, game.player.y)
+        target = game.nearest_player(self.x, self.y)
+        dist = distance(self.x, self.y, target.x, target.y)
 
         if self.fuse is None:
             if dist <= self.trigger_range:
@@ -511,7 +521,7 @@ class Spitter(Enemy):
         super().update(dt, game)
         if not self.alive:
             return
-        player = game.player
+        player = game.nearest_player(self.x, self.y)
         dist = distance(self.x, self.y, player.x, player.y)
         self.fire_timer = max(0.0, self.fire_timer - dt)
 
@@ -534,7 +544,7 @@ class Spitter(Enemy):
 
     def _steering(self, game, dt):
         toward = super()._steering(game, dt)
-        player = game.player
+        player = game.nearest_player(self.x, self.y)
         dist = distance(self.x, self.y, player.x, player.y)
         self._last_distance = dist
         if dist < self.keep_min:

@@ -6,6 +6,8 @@ import math
 import os
 import random
 import sys
+import time
+from contextlib import contextmanager
 
 import pygame
 import spritebank
@@ -13,6 +15,7 @@ import spritebank
 import graphics_backend
 import soundbank
 import progression
+import zones
 from camera import Camera
 from settings import (
     AMBIENT_VOLUME,
@@ -42,6 +45,7 @@ from settings import (
     SHAKE_HIT,
     SHAKE_HURT,
     SHAKE_SHOOT,
+    SHOP_OPEN_DIST,
     SPAWN_FIRST_DELAY,
     SPAWN_INTERVAL_MIN,
     SPAWN_INTERVAL_START,
@@ -56,14 +60,17 @@ from settings import (
     STATE_SHOP,
     STATE_TITLE,
     STATE_TREE,
+    STATE_ONLINE,
     TITLE,
+    TILE,
     WIDTH,
     HEIGHT,
+    LOS_FADE_PX,
 )
 from world import World
 from drops import roll_drops
 from weapon_data import TOKEN_KEYS, TOKEN_NAMES
-from bosses import RECIPES, MATERIALS, roll_material, summon
+from bosses import RECIPES, MATERIALS, SoulShardDrop, roll_material, summon
 from exploration import Exploration
 from status_effects import (apply_bleed, apply_slow, apply_stun,
                            apply_vulnerable, update_bleed, update_dust)
@@ -72,14 +79,20 @@ from enemies import Bomber, Brute, Enemy, Runner, Spitter, Stalker, Tank
 from hud import HUD
 from lighting import LightingManager
 from player import Player
+import netplay
+from netplay import protocol
+from netplay import snapshot as net_snapshot
+from netplay.client_view import ClientView
+from netplay.online_ui import OnlineUI
+from netplay.session import ClientSession, HostSession, shop_near
 from projectiles import (ArcBolt, Bullet, Casing, DashGhost, EnemyShot,
                          Explosion, FloatingText, Particle, Spark)
 from shop import Shop
-from shop_ui import ShopUI
+from shop_ui import BUY_HANDLERS, ShopUI
 from skill_tree_ui import SkillTreeUI
 from descent import DescentManager
 from descent_ui import DescentUI
-from utils import circles_collide, distance, mix
+from utils import circles_collide, distance, fade_draw, mix
 import visuals
 
 
@@ -99,6 +112,21 @@ class Game:
         self.camera = Camera()
         self.hud = HUD()
         self.descent_ui = DescentUI()
+        # --- кооператив (netplay) ---
+        # role: None — одиночная игра, "host" / "client" — сессия.
+        self.online_ui = OnlineUI()
+        self.net_role = None
+        self.session = None
+        self.client_view = None
+        self.players = []          # все участники, локальный — первый
+        self.remote_players = []   # все, кроме локального
+        self.render_players = []   # кого включать в снимок мира
+        self.net_seq = 0
+        self.local_pid = 1
+        self.local_name = "Хост"
+        self.coop_active = False
+        self._online_actions = []
+        self._online_input_timer = 0.0
         # прозрачный слой для визуала атак ближнего боя (альфа-канал!)
         self.attack_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         # Полотно мира при снайперской оптике: больше окна, затем
@@ -115,12 +143,44 @@ class Game:
         soundbank.play_loop("ambient", AMBIENT_VOLUME)
 
     # ------------------------------------------------------------ СОЗДАНИЕ МИРА
-    def reset(self):
-        """Создаёт (или пересоздаёт после смерти) все объекты раунда."""
-        self.world = World()
+    def reset(self, seed=None, warm_chunks=True):
+        """Создаёт (или пересоздаёт после смерти) все объекты раунда.
+
+        seed передаётся кооперативом: клиенты обязаны получить ТОТ ЖЕ
+        мир, поэтому сид выбирает хост, а не каждый процесс. Одиночная
+        игра вызывает reset() без аргументов и получает случайный мир,
+        как и раньше.
+        """
+        # Сид и тип локации выбираются ДО создания мира: профиль зоны
+        # участвует в генерации ламп первого же чанка.
+        if seed is None:
+            seed = random.SystemRandom().randrange(0, 2**63)
+        self.seed = seed
+        self.zone_key = zones.zone_for_sector(1, seed)
+        self.zone_prev = self.zone_key   # новый забег — без перехода
+        self.world = World(seed=seed, zone_key=self.zone_key,
+                           prefetch=warm_chunks)
         start_x, start_y = self.world.player_start()
-        self.world.ensure_chunks_around(start_x, start_y, 2)
+        if warm_chunks:
+            self.world.ensure_chunks_around(start_x, start_y, 2)
+        else:
+            # Клиент: мир достраивается порциями в кадрах (без фриза).
+            self._begin_client_warm(start_x, start_y)
         self.player = Player(start_x, start_y)
+        # Стабильный идентификатор игрока переживает спуск и смерть:
+        # по нему сеть, награды и враги различают участников.
+        self.local_pid = getattr(self, "local_pid", 1)
+        self.player.pid = self.local_pid
+        self.player.is_local = True
+        self.player.name = getattr(self, "local_name", "Хост")
+        self.players = [self.player]
+        # Наблюдение павшего: pid соратника, за которым смотрит камера.
+        # Это ЛОКАЛЬНОЕ состояние взгляда, ему не нужен сетевой протокол.
+        self.spectate_pid = None
+        self._spectate_dir = 0
+        self.remote_players = []
+        self.render_players = self.players
+        self.coop_active = False
         self.enemies = []
         self.enemy_shots = []   # снаряды дальних врагов (M12)
         self.enemy_index = EnemySpatialIndex()
@@ -214,8 +274,22 @@ class Game:
                     if self.state == STATE_DESCENT:
                         self.descent_ui.handle_event(event, self)
                         continue
+                    if self.state == STATE_ONLINE:
+                        self.online_ui.handle_event(event, self)
+                        continue
+                    if (self.net_role == "client"
+                            and self.state == STATE_PLAYING
+                            and event.key not in (pygame.K_ESCAPE,
+                                                  pygame.K_F5)):
+                        # Клиент НЕ исполняет действия локально: он шлёт
+                        # намерение хосту. Поэтому двойного выстрела или
+                        # подбора из-за локальной копии здесь не бывает.
+                        self._client_key(event.key)
+                        continue
                     if event.key == pygame.K_F5:
                         spritebank.reload()
+                        visuals.reload_assets()
+                        self.world._wall_tile = None
                         if self.player.firearm is not None:
                             self.player.firearm.sprite = self.player.firearm._build_sprite()
                         melee = self.player.equipment.get("melee")
@@ -248,8 +322,19 @@ class Game:
                         self._handle_settings_menu(event.key)
                     elif self.state == STATE_DIFFICULTY:
                         self._handle_difficulty_menu(event.key)
-                    elif event.key == pygame.K_r and self.state == STATE_GAME_OVER:
-                        self.reset()
+                    elif (event.key == pygame.K_r
+                          and self.state == STATE_GAME_OVER):
+                        if (self.coop_active
+                                and self.net_role == 'host'
+                                and self.session is not None):
+                            # Перезапуск кооп-вылазки делает только хост:
+                            # новый seed сам перестроит мир у клиентов.
+                            self.session.start_run(self)
+                        elif self.net_role == 'client':
+                            self.toast('Перезапуск делает хост', 2.4,
+                                       color=(240, 190, 110))
+                        else:
+                            self.reset()
                     elif self.state == STATE_SHOP:
                         if event.key == pygame.K_e:
                             self.close_shop()      # E тоже закрывает
@@ -293,6 +378,8 @@ class Game:
                             self.player.use_artifact(self)    # активный артефакт
                         elif event.key == pygame.K_e:
                             # приоритет: маяк/лифт -> сундук -> магазин
+                            if not self.player.alive:
+                                continue
                             if not self.descent.interact(self):
                                 if not self.exploration.open_nearest(self):
                                     self.try_open_shop()
@@ -306,20 +393,35 @@ class Game:
                             self.debug_visible = not self.debug_visible                  # дерево навыков
             if self.exit_requested:
                 running = False
-            if self.state == STATE_PLAYING:
-                self.update(dt)
-            self.draw()
+            # Метрики бесплатны по кадру, но показывают, где реально
+            # уходит время: симуляция, сборка сцены или презентация.
+            metrics = self.video.metrics
+            if self.state == STATE_ONLINE:
+                with metrics.measure("update"):
+                    self.pump_online(dt)
+            elif self.state == STATE_PLAYING:
+                with metrics.measure("update"):
+                    self.update(dt)
+            elif (self.net_role == "client" and self.session is not None
+                  and self.state in (STATE_PAUSED, STATE_SHOP, STATE_TREE,
+                                     STATE_DESCENT)):
+                # Клиент не симулирует мир; даже с открытым окном он
+                # продолжает принимать снимки, иначе очередь сети росла бы.
+                with metrics.measure("update"):
+                    self._client_pump_only(dt)
+            with metrics.measure("draw"):
+                self.draw()
             self.video.present()
         self.video.close()
         pygame.quit()
 
     def _handle_title(self, key):
-        """Титульный экран: Начать / Сложность / Выход."""
+        """Титульный экран: Начать / Сложность / Онлайн / Выход."""
         if key in (pygame.K_w, pygame.K_UP):
-            self.title_index = (self.title_index - 1) % 3
+            self.title_index = (self.title_index - 1) % 4
             soundbank.play("ui_move")
         elif key in (pygame.K_s, pygame.K_DOWN):
-            self.title_index = (self.title_index + 1) % 3
+            self.title_index = (self.title_index + 1) % 4
             soundbank.play("ui_move")
         elif key in (pygame.K_a, pygame.K_LEFT, pygame.K_d, pygame.K_RIGHT):
             if self.title_index == 1:
@@ -331,6 +433,7 @@ class Game:
                 soundbank.play("ui_move")
         elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             if self.title_index == 0:
+                self.online_leave()      # одиночная игра — без сети
                 self.reset()
                 soundbank.play("open")
             elif self.title_index == 1:
@@ -339,6 +442,9 @@ class Game:
                 self.difficulty_key = keys[index]
                 self.difficulty_menu_index = index
                 soundbank.play("ui_move")
+            elif self.title_index == 2:
+                self.open_online()
+                soundbank.play("open")
             else:
                 self.exit_requested = True
         elif key == pygame.K_ESCAPE:
@@ -366,6 +472,7 @@ class Game:
 
     def enter_title(self):
         """Выход в главное меню: раунд сбрасывается, рекорд остаётся."""
+        self.online_leave()
         self.reset()
         self.state = STATE_TITLE
         self.title_index = 0
@@ -473,6 +580,16 @@ class Game:
             self.state = STATE_PAUSED
 
     def update(self, dt):
+        if self.net_role == "client":
+            # Клиент не симулирует: только сеть, сглаживание и отрисовка.
+            self._client_update(dt)
+            return
+        if self.net_role == "host" and self.session is not None:
+            # Сеть обрабатывается ДО симуляции: ввод гостей должен попасть
+            # в этот же кадр, а отключения — не оставить «фантомного» игрока.
+            self.session.pump(self, dt)
+            for text, color, timer in self.session.drain_notices():
+                self.toast(text, timer, tuple(color or (255, 220, 140)))
         # камера живёт и во время «стопа кадра»: тряска должна доигрывать
         self.camera.update(dt)
         self._sync_camera_zoom()
@@ -511,14 +628,29 @@ class Game:
 
         # мышь сначала переводится в мировые координаты — дальше всё в мире
         mouse_world = self.camera.to_world(*pygame.mouse.get_pos())
+        if self.net_role == "host" and self.session is not None:
+            # Сначала ввод гостей, потом свой: все игроки обновляются в
+            # одном и том же кадре хоста, поэтому мир для всех един.
+            for client in self.session.clients:
+                if client.player is not None:
+                    self._apply_remote_input(client)
         self.player.handle_input(
             pygame.key.get_pressed(),
             mouse_world,
             pygame.mouse.get_pressed(),
         )
+        self._update_spectator_input()
         self.enemy_index.rebuild(self.enemies)
-        self.player.update(dt, self)
-        self.camera.follow(self.player.x, self.player.y)
+        for player in self.players:
+            if not player.alive:
+                # Павший не стреляет и не тратит предметы до следующего
+                # сектора — иначе смерть в кооперативе была бы выгодна.
+                player.trigger_held = False
+                player.melee_held = False
+                continue
+            player.update(dt, self)
+        view = self.view_player()
+        self.camera.follow(view.x, view.y)
         self.world.ensure_chunks_around(self.player.x, self.player.y, 2)
         self._sync_shops()
         self.exploration.update(self.player.x, self.player.y)
@@ -526,12 +658,12 @@ class Game:
 
         # Удаляем врагов, оставшихся далеко позади игрока, до расчёта ИИ.
         # Это не убийства: опыт, монеты и предметы не начисляются.
-        px, py = self.player.x, self.player.y
         despawn_distance_sq = ENEMY_DESPAWN_DISTANCE ** 2
         self.enemies = [
             enemy for enemy in self.enemies
-            if enemy.alive and (getattr(enemy, "is_boss", False) or (enemy.x - px) ** 2 + (enemy.y - py) ** 2
-            <= despawn_distance_sq)
+            if enemy.alive and (getattr(enemy, "is_boss", False)
+                                or self._nearest_distance_sq(enemy.x, enemy.y)
+                                <= despawn_distance_sq)
         ]
 
         # враги
@@ -582,8 +714,149 @@ class Game:
         self.grenades = [g for g in self.grenades if g.alive]
         self.drops = [d for d in self.drops if d.alive]
 
-        if not self.player.alive:
+        if self.coop_active:
+            if not any(player.alive for player in self.players):
+                self.state = STATE_GAME_OVER
+        elif not self.player.alive:
             self.state = STATE_GAME_OVER
+
+    # ------------------------------------------------------------ ЛИЧНОЕ vs ОБЩЕЕ
+    # Деньги, очки и убийства — ПЕРСОНАЛЬНЫЕ (ТЗ: отдельное развитие).
+    # Старые имена Game.money/score/kills оставлены как свойства локального
+    # героя, чтобы HUD, магазины и экран смерти не пришлось переписывать.
+    @property
+    def money(self):
+        return self.player.money
+
+    @money.setter
+    def money(self, value):
+        self.player.money = int(value)
+
+    @property
+    def score(self):
+        return self.player.score
+
+    @score.setter
+    def score(self, value):
+        self.player.score = int(value)
+
+    @property
+    def kills(self):
+        return self.player.kills
+
+    @kills.setter
+    def kills(self, value):
+        self.player.kills = int(value)
+
+    def nearest_player(self, x, y, alive_only=True):
+        """Предсказуемая цель для врага: ближайший живой игрок.
+
+        При равном расстоянии выбирает меньший pid — порядок обновления
+        списка игроков не должен менять поведение врагов (иначе два
+        клиента видели бы разные цели и «дёргались»).
+        """
+        candidates = [p for p in self.players if p.alive or not alive_only]
+        if not candidates:
+            return self.player
+        return min(candidates,
+                   key=lambda p: ((p.x - x) ** 2 + (p.y - y) ** 2, p.pid))
+
+    # ------------------------------------------------------------ НАБЛЮДЕНИЕ
+    def spectate_candidates(self):
+        """Живые герои, между которыми листает павший."""
+        return sorted((p for p in self.players if p.alive),
+                      key=lambda p: p.pid)
+
+    def view_player(self):
+        """Герой, вокруг которого строятся камера и свет.
+
+        Живой игрок смотрит за себя; павший — наблюдатель: камера
+        цепляется к ближайшему живому соратнику, а нажатия движения
+        листают остальных (никто не ждёт спуска вслепую).
+        """
+        local = self.player
+        if local is None or local.alive:
+            return local
+        candidates = self.spectate_candidates()
+        if not candidates:
+            return local
+        target = next((p for p in candidates if p.pid == self.spectate_pid),
+                      None)
+        if target is None:
+            target = min(candidates, key=lambda p: (
+                (p.x - local.x) ** 2 + (p.y - local.y) ** 2, p.pid))
+            self.spectate_pid = target.pid
+        return target
+
+    def cycle_spectate(self, step):
+        """Следующий/предыдущий живой соратник (по кругу)."""
+        candidates = self.spectate_candidates()
+        if len(candidates) < 2:
+            return False
+        pids = [p.pid for p in candidates]
+        try:
+            index = pids.index(self.spectate_pid)
+        except ValueError:
+            index = 0
+        self.spectate_pid = pids[(index + step) % len(pids)]
+        return True
+
+    def _update_spectator_input(self):
+        """A/D или стрелки листают наблюдаемых — только по краю нажатия."""
+        if not self.coop_active:
+            return
+        local = self.player
+        if local is None or local.alive or not self.spectate_candidates():
+            self._spectate_dir = 0
+            return
+        keys = pygame.key.get_pressed()
+        direction = (1 if keys[pygame.K_d] or keys[pygame.K_RIGHT] else 0) - (
+            1 if keys[pygame.K_a] or keys[pygame.K_LEFT] else 0)
+        if direction and direction != self._spectate_dir:
+            if self.cycle_spectate(direction):
+                soundbank.play("ui_move", 0.35)
+        self._spectate_dir = direction
+
+    def revive_player(self, player, x, y):
+        """Поднять павшего у алтаря: половина HP и потеря половины навыков."""
+        if player is None or player.alive:
+            return False
+        x, y = self.world.resolve_circle(x, y, player.radius)
+        player.x, player.y = float(x), float(y)
+        player.alive = True
+        player.hp = max(1.0, player.max_hp * 0.5)
+        player.hurt_timer = 0.0
+        player.invuln_timer = 1.2      # секунда на осмотреться после возврата
+        player.cancel_charge()
+        lost = player.lose_half_skills()
+        self.effects.append(FloatingText(player.x, player.y - 30,
+                                         "ВОЗВРАЩЕНИЕ", (198, 158, 255),
+                                         20, 70.0))
+        soundbank.play("heal", 0.85)
+        self.camera.add_shake(4.0)
+        self.toast(f"{player.name} возвращён · сгорело навыков: {lost}", 3.2,
+                   color=(198, 160, 255))
+        if player is self.player:
+            self.spectate_pid = None
+        return True
+
+    def player_within(self, x, y, radius):
+        """Есть ли живой игрок в радиусе (общие цели: маяк, лифт)."""
+        limit = radius * radius
+        for player in self.players:
+            if not player.alive:
+                continue
+            if (player.x - x) ** 2 + (player.y - y) ** 2 <= limit:
+                return player
+        return None
+
+    def _nearest_distance_sq(self, x, y):
+        best = None
+        for player in self.players:
+            dist = (player.x - x) ** 2 + (player.y - y) ** 2
+            if best is None or dist < best:
+                best = dist
+        return float("inf") if best is None else best
 
     # ------------------------------------------------------------ СОБЫТИЯ БОЯ
     @property
@@ -599,10 +872,12 @@ class Game:
         self.toast_timer = duration
         self.toast_color = color
 
-    def on_shot(self, weapon):
+    def on_shot(self, weapon, player=None):
         """Звук/тряска/гильза на каждый выстрел."""
-        self.shots_fired += 1
-        self.recoil = min(1.0, self.recoil + 0.16)
+        player = self.player if player is None else player
+        if player is self.player:
+            self.shots_fired += 1
+            self.recoil = min(1.0, self.recoil + 0.16)
         shake = weapon.mode_profile.get(
             "shake", weapon.spec.get("shake", SHAKE_SHOOT))
         self.camera.add_shake(shake * (1.0 + self.recoil * 0.4))
@@ -610,8 +885,8 @@ class Game:
             # У плазмы нет гильзы; вместо неё игрок видит вспышку и шлейф.
             return
         muzzle_angle = self.player.angle
-        mx = self.player.x + math.cos(muzzle_angle) * (weapon.muzzle_offset - 6)
-        my = self.player.y + math.sin(muzzle_angle) * (weapon.muzzle_offset - 6)
+        mx = player.x + math.cos(muzzle_angle) * (weapon.muzzle_offset - 6)
+        my = player.y + math.sin(muzzle_angle) * (weapon.muzzle_offset - 6)
         if random.random() < 0.75:
             self.effects.append(Casing(mx, my, muzzle_angle))
 
@@ -629,9 +904,14 @@ class Game:
             self.effects.append(Spark(enemy.x, enemy.y, enemy.angle,
                                       (255, 110, 90), 90))
 
-    def on_player_hurt(self, amount):
-        """Обратная связь при получении урона."""
-        self.camera.add_shake(SHAKE_HURT, self.player.angle + math.pi)
+    def on_player_hurt(self, amount, player=None):
+        """Обратная связь при получении урона (только для локального)."""
+        player = self.player if player is None else player
+        if player is not self.player:
+            # Чужой игрок получает урон на хосте, но тряска камеры —
+            # событие ТОГО клиента, а не всех участников.
+            return
+        self.camera.add_shake(SHAKE_HURT, player.angle + math.pi)
         self.damage_flash = min(1.0, self.damage_flash + 0.8)
         self.hitstop = max(self.hitstop, 0.045)
         if self.combo >= 5:
@@ -639,10 +919,12 @@ class Game:
         self.combo = 0
         self.combo_timer = 0.0
 
-    def on_player_death(self):
+    def on_player_death(self, player=None):
         """Фиксируем рекорд до показа экрана смерти."""
-        self.best_score = max(self.best_score, self.score)
-        self.player.cancel_charge()
+        player = self.player if player is None else player
+        if player is self.player:
+            self.best_score = max(self.best_score, self.score)
+        player.cancel_charge()
         soundbank.play("enemy_die", 0.4)
 
     # ------------------------------------------------------------ СПАВН
@@ -672,9 +954,13 @@ class Game:
         enemy_class = self._pick_enemy_class()
         for _ in range(50):   # 50 попыток найти подходящее место
             try:
+                # Спавн идёт вокруг СЛУЧАЙНОГО живого игрока, но не ближе
+                # SPAWN_MIN_DISTANCE ни к одному из них.
+                anchors = [p for p in self.players if p.alive] or [self.player]
+                anchor = random.choice(anchors)
                 x, y = self.world.random_floor_position(
                     enemy_class.radius,
-                    center=self.player.pos,
+                    center=anchor.pos,
                     min_distance=SPAWN_MIN_DISTANCE,
                     max_distance=1500,
                 )
@@ -682,7 +968,7 @@ class Game:
                 # свободного места рядом нет (редкий тупик) — просто
                 # пропускаем этот спавн, игра не должна падать из-за моба
                 return
-            if distance(x, y, self.player.x, self.player.y) < SPAWN_MIN_DISTANCE:
+            if self._nearest_distance_sq(x, y) < SPAWN_MIN_DISTANCE ** 2:
                 continue
             if any(distance(x, y, shop.x, shop.y)
                    < shop.interior_radius + enemy_class.radius
@@ -763,7 +1049,7 @@ class Game:
                     )
                 except RuntimeError:
                     break
-                if distance(x, y, self.player.x, self.player.y) < 170:
+                if self._nearest_distance_sq(x, y) < 170 ** 2:
                     continue
                 if any(distance(x, y, shop.x, shop.y)
                        < shop.interior_radius + enemy_class.radius
@@ -812,8 +1098,7 @@ class Game:
                     continue
                 if id(enemy) in bullet.hit_enemies:
                     continue
-                if circles_collide(bullet.x, bullet.y, bullet.radius,
-                                   enemy.x, enemy.y, enemy.radius):
+                if enemy.hit_test(bullet.x, bullet.y, bullet.radius):
                     self._bullet_hit(bullet, enemy)
                     if not bullet.alive:
                         break   # пуля исчерпала пробитие — дальше не летит
@@ -845,7 +1130,8 @@ class Game:
             # СИНЕРГИЯ: только что взорванная цель (дробь-подрывник)
             # добивается любым снарядом эффективнее
             damage *= EXPLOSION_SYNERGY
-        execute = getattr(self.player, "execute_bonus", 0.0)
+        owner = getattr(bullet, "owner", None) or self.player
+        execute = getattr(owner, "execute_bonus", 0.0)
         if execute > 0.0 and enemy.hp <= enemy.max_hp * 0.35:
             damage *= 1.0 + execute           # усиление «Добивание»
 
@@ -856,9 +1142,12 @@ class Game:
         # Кровотечение ставим ДО прямого урона: добивающий выстрел тоже
         # оставляет рану, и «Кровавая картечь» разносит её при смерти.
         if bullet.bleed and enemy.alive:
-            apply_bleed(enemy, damage * min(1.0, bullet.bleed))
-        self.damage_enemy(enemy, damage, knockback_dir, bullet.knockback)
-        self.shots_hit += 1
+            apply_bleed(enemy, damage * min(1.0, bullet.bleed),
+                        source=owner)
+        self.damage_enemy(enemy, damage, knockback_dir, bullet.knockback,
+                          source=owner)
+        if owner is self.player:
+            self.shots_hit += 1
         bullet.hits += 1
         bullet.hit_enemies.add(id(enemy))
         distance_from_shot = math.hypot(enemy.x - bullet.spawn_x,
@@ -895,7 +1184,7 @@ class Game:
             self.explode(
                 enemy.x, enemy.y, r,
                 r * EXPLOSION_DAMAGE_PER_PX * bullet.explosion_power,
-                140.0, hurt_player=False,
+                140.0, hurt_player=False, source=owner,
                 bleed=bullet.explosion_bleed,
                 slow=bullet.explosion_slow,
                 color=bullet.explosion_color)
@@ -919,12 +1208,13 @@ class Game:
                 radius = bullet.bleed_spread_radius
                 for other in self.nearby_enemies(enemy.x, enemy.y, radius):
                     if other is not enemy and other.alive:
-                        apply_bleed(other, damage * bullet.bleed_spread)
+                        apply_bleed(other, damage * bullet.bleed_spread,
+                                    source=owner)
             # «Цепная детонация»/«Каскад»: убийство рождает второй взрыв
             if bullet.cascade:
                 r = bullet.cascade
                 self.explode(enemy.x, enemy.y, r, r * EXPLOSION_DAMAGE_PER_PX,
-                             140.0, hurt_player=False)
+                             140.0, hurt_player=False, source=owner)
             # «Осколочный каскад»: из точки смерти летят лёгкие дробины
             if bullet.cascade_shrapnel:
                 for _ in range(int(bullet.cascade_shrapnel)):
@@ -935,11 +1225,12 @@ class Game:
                         speed=math.hypot(bullet.vx, bullet.vy) * 0.8,
                         radius=bullet.radius,
                     )
+                    shrapnel.owner = owner
                     self.bullets.append(shrapnel)
             # «Добивание» (ветвь Экономист): убийство возвращает боезапас
             if (bullet.refund_kill_amount
                     and random.random() < bullet.refund_kill_chance):
-                self.player.equipment.add_ammo(bullet.refund_kill_amount)
+                owner.equipment.add_ammo(bullet.refund_kill_amount)
 
         if bullet.pierces_further():
             return
@@ -980,7 +1271,8 @@ class Game:
             span = max(best_d, 1.0)
             self.damage_enemy(best, dealt,
                               ((best.x - prev_x) / span,
-                               (best.y - prev_y) / span), 40.0)
+                               (best.y - prev_y) / span), 40.0,
+                              source=getattr(bullet, "owner", None))
             seen.add(id(best))
             bullet.chain_hit.add(id(best))
             prev_x, prev_y = best.x, best.y
@@ -1001,12 +1293,15 @@ class Game:
         soundbank.play("enemy_shot", 0.45)
 
     def _check_enemy_shot_hits(self):
-        player = self.player
         for shot in self.enemy_shots:
-            if not shot.alive or not player.alive:
+            if not shot.alive:
                 continue
-            if circles_collide(shot.x, shot.y, shot.radius,
-                               player.x, player.y, player.radius):
+            for player in self.players:
+                if not player.alive:
+                    continue
+                if not circles_collide(shot.x, shot.y, shot.radius,
+                                       player.x, player.y, player.radius):
+                    continue
                 player.take_damage(shot.damage, self)
                 for _ in range(6):
                     self.effects.append(Spark(
@@ -1014,6 +1309,7 @@ class Game:
                         (156, 248, 192), 180))
                 self.camera.add_shake(2.4)
                 shot.kill()
+                break
 
     def descend_to_next(self):
         """
@@ -1024,21 +1320,41 @@ class Game:
         старого сектора не переезжают — иначе спуск был бы наказанием.
         """
         self.depth += 1
-        self.score += 500 * (self.depth - 1)
-        self.world = World()
+        # Очки за глубину — каждому участнику: это общий рубеж.
+        for player in self.players:
+            player.score += 500 * (self.depth - 1)
+        # Новый сид и тип локации: переход между типами плавный
+        # (zone_profile смешивает профили в течение ZONE_TRANSITION_TIME).
+        seed = random.SystemRandom().randrange(0, 2**63)
+        new_zone = zones.zone_for_sector(self.depth, seed)
+        self.zone_prev = getattr(self, "zone_key", new_zone)
+        self.zone_key = new_zone
+        self.world = World(seed=seed, zone_key=new_zone)
         start_x, start_y = self.world.player_start()
         self.world.ensure_chunks_around(start_x, start_y, 2)
-        self.player.x, self.player.y = start_x, start_y
-        self.player.cancel_charge()
-        self.player.dash_timer = 0.0
-        self.player.invuln_timer = 0.0
-        self.player.hurt_timer = 0.0
-        self.player.heal(self.player.max_hp * 0.22)
-        weapon = self.player.firearm
-        if weapon is not None:
-            weapon.loaded = weapon.magazine_size
-            weapon.reload_timer = 0.0
-            weapon._reload_take = 0
+        # Все участники переезжают в новый сектор вместе. Павшие
+        # возвращаются к лифту с 40% HP: правило «смерть — до конца
+        # сектора» без воскрешения в бою.
+        for index, player in enumerate(self.players):
+            offset = 0.0 if index == 0 else 44.0 * ((index + 1) // 2)
+            side = 1.0 if index % 2 else -1.0
+            player.x, player.y = self.world.resolve_circle(
+                start_x + offset * side, start_y + offset * 0.5,
+                player.radius)
+            player.cancel_charge()
+            player.dash_timer = 0.0
+            player.invuln_timer = 0.0
+            player.hurt_timer = 0.0
+            if not player.alive:
+                player.alive = True
+                player.hp = player.max_hp * 0.4
+            else:
+                player.heal(player.max_hp * 0.22)
+            weapon = player.firearm
+            if weapon is not None:
+                weapon.loaded = weapon.magazine_size
+                weapon.reload_timer = 0.0
+                weapon._reload_take = 0
 
         self.enemies = []
         self.enemy_shots = []
@@ -1060,21 +1376,26 @@ class Game:
         self.spawn_timer = SPAWN_FIRST_DELAY + 1.0
         self.boss_menu = False
         self.descent = DescentManager(self, self.depth)
+        self.spectate_pid = None
+        self._spectate_dir = 0
         self.camera.follow(self.player.x, self.player.y)
         self.camera.reset_shake()
         self.descent_ui.open(self)
         self.state = STATE_DESCENT
+        self.toast(f"ЛОКАЦИЯ · {zones.profile(self.zone_key)['name']}",
+                   3.5, color=(150, 226, 210))
 
-    def use_melee_ability(self):
-        """X: weapon-specific active attack, cooldown shared per melee weapon."""
-        weapon = self.player.melee
+    def use_melee_ability(self, player=None):
+        """X: активная атака оружия ближнего боя (кулдаун общий на ствол)."""
+        player = self.player if player is None else player
+        weapon = player.melee
         if weapon is None or self.active_cooldown > 0:
             return
         kind = weapon.key if hasattr(weapon, "key") else weapon.spec.get("key", "")
         if not kind:
             kind = weapon.spec.get("id", "")
-        angle = self.player.angle
-        x, y = self.player.x, self.player.y
+        angle = player.angle
+        x, y = player.x, player.y
         dx, dy = math.cos(angle), math.sin(angle)
         base = weapon.spec.get("damage", 20)
         abilities = {
@@ -1099,14 +1420,14 @@ class Game:
                 if enemy.alive and (enemy.x - cx) ** 2 + (enemy.y - cy) ** 2 < radius ** 2:
                     apply_bleed(enemy, base * 1.2)
         elif kind == "shield":
-            self.player.heal(8)
+            player.heal(8)
         self.active_cooldown = 9.0
 
     def nearby_enemies(self, x, y, radius):
         return self.enemy_index.query(x, y, radius)
 
     def damage_enemy(self, enemy, damage, knockback_dir=None, knockback=0.0,
-                     show_number=True):
+                     show_number=True, source=None):
         """
         ЕДИНСТВЕННОЕ место, где наносится урон врагу.
 
@@ -1116,9 +1437,11 @@ class Game:
         """
         if getattr(enemy, "vulnerable_timer", 0.0) > 0.0:
             damage *= getattr(enemy, "vulnerable_mul", 1.0)
+        source = self.player if source is None else source
         dealt = damage * getattr(enemy, "armor_factor", 1.0)
         enemy.take_damage(dealt)
-        self.hitmarker_timer = max(self.hitmarker_timer, 0.12)
+        if source is self.player:
+            self.hitmarker_timer = max(self.hitmarker_timer, 0.12)
         if knockback and knockback_dir:
             enemy.apply_knockback(knockback_dir, knockback)
 
@@ -1141,39 +1464,43 @@ class Game:
             self._spawn_particles(enemy, 3)
             for _ in range(3):
                 self.effects.append(Spark(enemy.x, enemy.y,
-                                          math.atan2(enemy.y - self.player.y,
-                                                     enemy.x - self.player.x),
+                                          math.atan2(enemy.y - source.y,
+                                                     enemy.x - source.x),
                                           (255, 220, 150)))
             self.camera.add_shake(SHAKE_HIT)
             if self._hit_sound_cd <= 0.0:
                 self._hit_sound_cd = 0.035
                 soundbank.play("hit", 0.38)   # не 7 наложений от дроби
         else:
-            self.hitmarker_timer = 0.24
-            self._on_enemy_killed(enemy)
+            if source is self.player:
+                self.hitmarker_timer = 0.24
+            self._on_enemy_killed(enemy, source)
 
-    def _on_enemy_killed(self, enemy):
-        self.kills += 1
-        # СЕРИЯ: убийства подряд увеличивают награду. Игрок сам решает,
-        # идти ли вперёд за деньгами или отступить и сохранить жизнь.
-        self.combo = min(COMBO_MAX + 20, self.combo + 1)
-        self.combo_timer = COMBO_WINDOW
-        self.max_combo = max(self.max_combo, self.combo)
-        multiplier = self.combo_multiplier
+    def _on_enemy_killed(self, enemy, source=None):
+        # Награда уходит ВЛАДЕЛЬЦУ добивающего урона (последний удар).
+        # Серия — личный счётчик локального героя и от чужих убийств
+        # не растёт, иначе HUD показывал бы чужой ритм боя.
+        source = self.player if source is None else source
+        source.kills += 1
+        if source is self.player:
+            self.combo = min(COMBO_MAX + 20, self.combo + 1)
+            self.combo_timer = COMBO_WINDOW
+            self.max_combo = max(self.max_combo, self.combo)
+        multiplier = self.combo_multiplier if source is self.player else 1.0
         depth_mult = 1.0 + (max(1, getattr(self, "depth", 1)) - 1) * DEPTH_LOOT_GROWTH
-        self.score += int(round(enemy.score * multiplier * depth_mult))
+        source.score += int(round(enemy.score * multiplier * depth_mult))
         gain = max(1, int(round(
             enemy.bounty * (0.7 + 0.3 * multiplier) * multiplier
-            * depth_mult * self.player.boon_loot_mult
-            * (1.0 + self.player.skill_mod("loot_add")))))
-        self.money += gain
+            * depth_mult * source.boon_loot_mult
+            * (1.0 + source.skill_mod("loot_add")))))
+        source.money += gain
 
         self.effects.append(FloatingText(
             enemy.x, enemy.y - enemy.radius * 0.9, f"+{gain}",
             (255, 208, 100), 21, 64.0))
-        if self.player.boon_lifesteal > 0.0:
-            self.player.heal(self.player.boon_lifesteal)
-            self.effects.append(Particle(self.player.x, self.player.y,
+        if source.boon_lifesteal > 0.0:
+            source.heal(source.boon_lifesteal)
+            self.effects.append(Particle(source.x, source.y,
                                          (122, 242, 156)))
         soundbank.play("kill", 0.7)
         soundbank.play("enemy_die", 0.45)
@@ -1196,11 +1523,14 @@ class Game:
             self.drops.append(ArtifactDrop(enemy.x + 18, enemy.y, random.choice(ALL_KEYS)))
             self.drops.append(AmmoDrop(enemy.x - 18, enemy.y, 80))
             self.drops.append(HealDrop(enemy.x, enemy.y + 20, 2))
+            # Осколок души — только с босса: воскрешение павшего у алтаря
+            self.drops.append(SoulShardDrop(enemy.x - 22, enemy.y - 16))
             # Босс — гарантированный источник жетонов: их хватает и на
             # подготовку чужой школы, и на углубление второй ветви.
             for key in random.sample(TOKEN_KEYS, BOSS_TOKEN_REWARD):
-                self.player.add_weapon_token(key, 1)
-            self.boss_kills += 1
+                source.add_weapon_token(key, 1)
+            if source is self.player:
+                self.boss_kills += 1
             self.camera.add_shake(10)
             self.hitstop = max(self.hitstop, HITSTOP_BIG * 2)
             self.toast("БОСС ПОВЕРЖЕН — артефакт, припасы и жетоны на земле", 4.0,
@@ -1208,17 +1538,18 @@ class Game:
         elif (getattr(enemy, "elite", False)
               and random.random() < ELITE_TOKEN_CHANCE):
             key = random.choice(TOKEN_KEYS)
-            self.player.add_weapon_token(key, 1)
-            self.toast(f"ЭЛИТА: жетон школы «{TOKEN_NAMES[key]}»", 2.2,
-                       color=(255, 208, 140))
+            source.add_weapon_token(key, 1)
+            if source is self.player:
+                self.toast(f"ЭЛИТА: жетон школы «{TOKEN_NAMES[key]}»", 2.2,
+                           color=(255, 208, 140))
         # событийный хук пассивного артефакта (M7): «Пожиратель» лечит
         # и т.п. Нет артефакта или нет хука — база отвечает пустотой.
-        passive = self.player.equipment.get("passive_artifact")
+        passive = source.equipment.get("passive_artifact")
         if passive is not None:
-            passive.on_kill(self.player, self, enemy)
+            passive.on_kill(source, self, enemy)
 
     def explode(self, x, y, radius, damage, knockback, hurt_player=True,
-                bleed=0.0, slow=0.0, color=None):
+                bleed=0.0, slow=0.0, color=None, source=None):
         """
         Взрыв (граната, бомбер или дропина M11): урон по площади с
         затуханием по расстоянию, плюс свет и частицы.
@@ -1246,19 +1577,25 @@ class Game:
                 knockback_dir=((enemy.x - x) / max(dist, 1.0),
                                (enemy.y - y) / max(dist, 1.0)),
                 knockback=knockback * scale,
+                source=source,
             )
             if enemy.alive:
                 if bleed:
-                    apply_bleed(enemy, dealt * bleed)
+                    apply_bleed(enemy, dealt * bleed, source=source)
                 if slow:
                     apply_slow(enemy, slow, 0.55)
 
         if hurt_player:
-            player = self.player
-            dist = distance(x, y, player.x, player.y)
-            if dist <= radius + player.radius:
-                scale = 1.0 - 0.5 * min(1.0, dist / radius)
-                player.take_damage(damage * scale, self)
+            # Взрыв бьёт ВСЕХ в радиусе, кроме того, кто его устроил:
+            # своя граната в кооперативе не калечит себя, но чужая
+            # (и бомбер) — полноценная угроза для всех.
+            for player in self.players:
+                if player is source or not player.alive:
+                    continue
+                dist = distance(x, y, player.x, player.y)
+                if dist <= radius + player.radius:
+                    scale = 1.0 - 0.5 * min(1.0, dist / radius)
+                    player.take_damage(damage * scale, self)
 
         self.effects.append(Explosion(x, y, radius, color=color))
         particle_color = tuple(color or (255, 170, 60))
@@ -1371,8 +1708,82 @@ class Game:
             self.attack_overlay = pygame.Surface(size, pygame.SRCALPHA)
         return self.attack_overlay
 
+    def zone_profile(self):
+        """
+        Профиль текущей локации (settings.ZONE_PROFILES) с плавным
+        переходом от предыдущего типа: elapsed сбрасывается при старте
+        сектора, поэтому смена типа докручивается за ZONE_TRANSITION_TIME.
+        """
+        if self.zone_prev == self.zone_key:
+            return zones.profile(self.zone_key)
+        t = zones.transition_progress(self.elapsed)
+        return zones.blend_profile(self.zone_prev, self.zone_key, t)
+
+    def entity_fade(self, x, y, prof=None):
+        """
+        0..1 — насколько объект в мировой точке (x, y) должен быть проявлен.
+
+        Это замена бинарного гейта «рисовать / не рисовать»: объект
+        рисуется с прозрачностью, поэтому у края света и у стен он
+        гаснет/проявляется плавно, а не рывком.
+
+        Составляющие:
+          * свет — конус фонарика, лампы, вспышки (reveal-штора БЕЗ
+            личного ореола): за спиной и вне конуса в темноте объект
+            не проявляется вовсе;
+          * smoothstep по профилю (zones.visibility) — прозрачность
+            теряется постепенно с удалением от яркой части света;
+          * мягкие стены — alpha падает по мере того, сколько пикселей
+            отрезка игрок→объект проходит сквозь стены (LOS_FADE_PX).
+        """
+        prof = self.zone_profile() if prof is None else prof
+        sx, sy = self.camera.to_screen(x, y)
+        if prof.get("gated", False):
+            alpha = zones.visibility(
+                self.lighting.reveal_at(sx, sy), 0.0, prof)
+            if alpha <= 0.0:
+                return 0.0
+        else:
+            alpha = 1.0
+        blocked = self._line_of_sight_px(x, y)
+        if blocked > 0.0:
+            alpha *= max(0.0, 1.0 - blocked / LOS_FADE_PX)
+        return alpha
+
+    def _line_of_sight_px(self, x, y, step_px=6.0):
+        """
+        Сколько пикселей отрезка игрок→точка проходит сквозь стены.
+
+        0 — прямая видимость; ~толщина стены и больше — обзор закрыт.
+        По этой длине объект гаснет плавно (см. entity_fade): у угла
+        стены он теряет прозрачность постепенно, а не пропадает сразу.
+        """
+        observer = self.view_player()
+        px, py = observer.x, observer.y
+        dx, dy = x - px, y - py
+        dist = math.hypot(dx, dy)
+        if dist < 1.0:
+            return 0.0
+        steps = min(140, max(2, int(dist / step_px) + 1))
+        solid = self.world.is_solid_at
+        step_len = dist / steps
+        blocked = 0.0
+        for i in range(1, steps):
+            t = i / steps
+            if solid(px + dx * t, py + dy * t):
+                blocked += step_len
+        return blocked
+
+    def _fade_draw(self, surface, x, y, alpha, draw_fn, margin=96):
+        """Рисует объект с прозрачностью alpha (см. utils.fade_draw)."""
+        sx, sy = self.camera.to_screen(x, y)
+        fade_draw(surface, sx, sy, alpha, draw_fn, margin)
+
     def draw(self):
         screen = self.screen
+        if self.state == STATE_ONLINE:
+            self.online_ui.draw(screen, self)
+            return
         if self.state == STATE_TITLE:
             self.hud.draw_title(screen, self)
             return
@@ -1380,110 +1791,198 @@ class Game:
             # Доска навыков непрозрачна: не тратим кадр на мир и HUD под ней.
             self.skill_ui.draw(screen, self)
             return
-
-        # 1. физический слой мира
+        if getattr(self, "_warm_loading", False):
+            # Сектор достраивается порциями: честный прогресс вместо фриза.
+            self._draw_world_sync(screen)
+            return
+        # 0. свет строится ДО объектов: в тёмной локации видимость
+        # читает световую штору (гейт «рисовать / не рисовать»).
         world = screen
         if self.camera.is_zoomed:
             world = self._world_layer_for(
                 (self.camera.view_w, self.camera.view_h))
         self.lighting.set_view(*world.get_size())
-        self.world.draw(world, self.camera)
-        self.exploration.draw(world, self.camera, self.player)
-        self.descent.draw(world, self.camera, self.elapsed)
-        for effect in self.effects:
-            if not effect.emissive and self.camera.is_visible(effect.x, effect.y):
-                effect.draw(world, self.camera)
-        for drop in self.drops:
-            if self.camera.is_visible(drop.x, drop.y):
-                drop.draw(world, self.camera)
-        for grenade in self.grenades:
-            grenade.draw(world, self.camera)
-        for shop in self.shops:
-            if self.camera.is_visible(shop.x, shop.y, shop.light_radius):
-                shop.draw(world, self.camera)
-        for enemy in self.enemies:
-            if self.camera.is_visible(enemy.x, enemy.y):
-                enemy.draw(world, self.camera)
+        prof = self.zone_profile()
+        self.lighting.set_profile(prof)
+        # Плавная видимость вместо гейта «рисовать / не рисовать»:
+        # alpha = свет (конус/лампы/вспышки, БЕЗ ореола) × мягкие стены.
+        # 0 — объект не рисуется; 0..1 — проявляется/гаснет постепенно.
+        def fade(x, y):
+            return self.entity_fade(x, y, prof)
 
-        # 2. свет: дуло, взрывы, магазины и лампы комнат
-        player_screen = self.camera.to_screen(self.player.x, self.player.y)
-        weapon = self.player.firearm
+        # 0a. источники света: дуло, взрывы, магазины, лампы комнат
+        # Павший наблюдает за живым соратником — свет и камера строятся
+        # вокруг НЕГО, иначе экран оставался бы тёмным пятном у тела.
+        view = self.view_player()
+        player_screen = self.camera.to_screen(view.x, view.y)
+        weapon = view.firearm
         muzzle_offset = weapon.muzzle_offset if weapon else 0
         muzzle_world = (
-            self.player.x + math.cos(self.player.angle) * muzzle_offset,
-            self.player.y + math.sin(self.player.angle) * muzzle_offset,
+            view.x + math.cos(view.angle) * muzzle_offset,
+            view.y + math.sin(view.angle) * muzzle_offset,
         )
         muzzle_screen = self.camera.to_screen(*muzzle_world)
         flashes = [
             (*self.camera.to_screen(effect.x, effect.y), effect.light_radius,
-             getattr(effect, "light_color", (255, 168, 84)))
+             getattr(effect, "light_color", (255, 168, 84)),
+             None, (effect.x, effect.y))
             for effect in self.effects
             if effect.light_radius
             and self.camera.is_visible(effect.x, effect.y, effect.light_radius)
         ]
         flashes += [
-            (*self.camera.to_screen(shop.x, shop.y), shop.light_radius, shop.color)
+            (*self.camera.to_screen(shop.x, shop.y), shop.light_radius,
+             shop.color, None, (shop.x, shop.y))
             for shop in self.shops
             if self.camera.is_visible(shop.x, shop.y, shop.light_radius)
         ]
         for lamp in self.world.lamps_near(self.player.x, self.player.y, 1500):
             if self.camera.is_visible(lamp["x"], lamp["y"], lamp["radius"]):
                 sx, sy = self.camera.to_screen(lamp["x"], lamp["y"])
-                flicker = 0.86 + 0.14 * math.sin(self.elapsed * 5.0 + lamp["phase"])
-                flashes.append((sx, sy, int(lamp["radius"] * flicker), lamp["color"]))
+                # Профиль мерцания общий с плафоном (zones.flicker) —
+                # пятый элемент вспышки задаёт готовую силу света,
+                # шестой — мировую позицию (для обрезки света стенами).
+                # Сила света квантуется по 0.2: «умирающая» лампа иначе
+                # просит пересборку света каждый кадр, а шаг в 20% на
+                # мерцающем источнике глазом не читается.
+                strength = round(zones.flicker(lamp.get("flicker", "steady"),
+                                               self.elapsed, lamp["phase"]) * 5) / 5
+                flashes.append((sx, sy, lamp["radius"], lamp["color"],
+                                strength, (lamp["x"], lamp["y"])))
         for bx, by, radius, color in self.descent.lights():
             if self.camera.is_visible(bx, by, radius):
                 sx, sy = self.camera.to_screen(bx, by)
                 pulse = 0.82 + 0.18 * math.sin(self.elapsed * 3.2 + bx * 0.01)
-                flashes.append((sx, sy, int(radius * pulse), color))
+                flashes.append((sx, sy, int(radius * pulse), color,
+                                None, (bx, by)))
         for shot in self.enemy_shots:
             if shot.light_radius and self.camera.is_visible(
                     shot.x, shot.y, shot.light_radius):
                 sx, sy = self.camera.to_screen(shot.x, shot.y)
+                # Снаряд — движущийся свет: обрезку не кэшируем, свет мал.
                 flashes.append((sx, sy, shot.light_radius, shot.light_color))
 
         danger = 0.0
-        if self.player.alive:
-            ratio = self.player.hp / max(1, self.player.max_hp)
+        if view.alive:
+            ratio = view.hp / max(1, view.max_hp)
             if ratio < 0.35:
                 danger = (0.35 - ratio) / 0.35
-        self.lighting.render(world, player_screen, muzzle_screen,
-                             self.player.angle, self.player.flash_timer,
-                             flashes, time=self.elapsed, danger=danger,
-                             hurt=self.damage_flash)
+        self.lighting.build_mask(
+            player_screen, muzzle_screen, view.angle,
+            view.flash_timer, flashes, time=self.elapsed,
+            player_world=(view.x, view.y),
+            world_to_screen=self.camera.to_screen,
+            solid_at=self.world.is_solid_at)
+
+        # 1. физический слой мира
+        self.world.draw(world, self.camera)
+        self.exploration.draw(world, self.camera, view, visible=fade)
+        self.descent.draw(world, self.camera, self.elapsed)
+        for effect in self.effects:
+            if not effect.emissive and self.camera.is_visible(effect.x, effect.y):
+                effect.draw(world, self.camera)
+        for drop in self.drops:
+            if self.camera.is_visible(drop.x, drop.y):
+                a = fade(drop.x, drop.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(world, drop.x, drop.y, a,
+                                lambda d=drop: d.draw(world, self.camera), 64)
+        for grenade in self.grenades:
+            grenade.draw(world, self.camera)
+        for shop in self.shops:
+            if self.camera.is_visible(shop.x, shop.y, shop.light_radius):
+                a = fade(shop.x, shop.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(world, shop.x, shop.y, a,
+                                lambda s=shop: s.draw(world, self.camera), 110)
+        for enemy in self.enemies:
+            extent = enemy.fade_margin
+            if self.camera.is_visible(enemy.x, enemy.y, extent):
+                a = fade(enemy.x, enemy.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(world, enemy.x, enemy.y, a,
+                                lambda e=enemy: e.draw(world, self.camera),
+                                extent)
+
+        # 2. штора накладывается на отрисованную сцену
+        self.lighting.apply(world, danger=danger, hurt=self.damage_flash,
+                            time=self.elapsed)
 
         # 3. геометрия и светящиеся объекты — поверх темноты
-        self.world.draw_edges(world, self.camera)
+        if prof.get("edges", True):
+            self.world.draw_edges(world, self.camera)
         self.world.draw_lamps(world, self.camera, self.elapsed)
         for shop in self.shops:
             if self.camera.is_visible(shop.x, shop.y, shop.light_radius):
-                shop.draw_overlay(world, self.camera, self.elapsed)
-        self.exploration.draw_overlay(world, self.camera, self.player)
-        self.descent.draw_overlay(world, self.camera, self.elapsed, self)
+                a = fade(shop.x, shop.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(
+                    world, shop.x, shop.y, a,
+                    lambda s=shop: s.draw_overlay(world, self.camera,
+                                                  self.elapsed), 110)
+        self.exploration.draw_overlay(world, self.camera, view,
+                                      visible=fade)
+        self.descent.draw_overlay(world, self.camera, self.elapsed, self,
+                                  visible=fade)
         for drop in self.drops:
             if self.camera.is_visible(drop.x, drop.y, 30):
-                drop.draw_glow(world, self.camera, self.elapsed)
+                a = fade(drop.x, drop.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(
+                    world, drop.x, drop.y, a,
+                    lambda d=drop: d.draw_glow(world, self.camera,
+                                               self.elapsed), 64)
 
         # визуал атак ближнего боя — ПОВЕРХ темноты, иначе удар не видно
-        melee = self.player.melee
+        melee = view.melee
         if melee is not None:
             overlay = self._attack_layer_for(world.get_size())
             overlay.fill((0, 0, 0, 0))
-            melee.draw(overlay, self.camera, self.player)
+            melee.draw(overlay, self.camera, view)
             world.blit(overlay, (0, 0))
 
-        # герой всегда яркий: он сам источник света
-        self.player.draw(world, self.camera)
+        # Свой герой всегда яркий (он сам источник света), чужие —
+        # проявляются по свету и видимости, как враги.
+        for player in self.players:
+            if player is self.player:
+                player.draw(world, self.camera)
+                continue
+            if not self.camera.is_visible(player.x, player.y):
+                continue
+            alpha = fade(player.x, player.y)
+            if alpha <= 0.01:
+                continue
+            self._fade_draw(world, player.x, player.y, alpha,
+                            lambda p=player: p.draw(world, self.camera), 96)
         for enemy in self.enemies:
             if self.camera.is_visible(enemy.x, enemy.y):
-                enemy.draw_overlay(world, self.camera)
+                a = fade(enemy.x, enemy.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(
+                    world, enemy.x, enemy.y, a,
+                    lambda e=enemy: e.draw_overlay(world, self.camera), 140)
 
         for bullet in self.bullets:
             if self.camera.is_visible(bullet.x, bullet.y):
-                bullet.draw(world, self.camera)
+                a = fade(bullet.x, bullet.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(world, bullet.x, bullet.y, a,
+                                lambda b=bullet: b.draw(world, self.camera),
+                                48)
         for shot in self.enemy_shots:
             if self.camera.is_visible(shot.x, shot.y):
-                shot.draw(world, self.camera)
+                a = fade(shot.x, shot.y)
+                if a <= 0.01:
+                    continue
+                self._fade_draw(world, shot.x, shot.y, a,
+                                lambda s=shot: s.draw(world, self.camera), 64)
         for effect in self.effects:
             if effect.emissive and self.camera.is_visible(effect.x, effect.y):
                 effect.draw(world, self.camera)
@@ -1496,7 +1995,7 @@ class Game:
         if self.debug_visible:
             lines = (f"FPS {self.clock.get_fps():.0f}  enemies {len(self.enemies)}  bullets {len(self.bullets)}",
                      f"Seed {self.world.seed}  chunks {len(self.world._chunks)}  effects {len(self.effects)}",
-                     f"Depth {self.depth}  beacons {self.descent.active_count}/{len(self.descent.beacons)}"
+                     f"Depth {self.depth}  zone {self.zone_key}  beacons {self.descent.active_count}/{len(self.descent.beacons)}"
                      f"  shots {len(self.enemy_shots)}",
                      f"Melee X: {self.active_cooldown:.1f}s   combo {self.combo}")
             for index, line in enumerate(lines):
@@ -1514,6 +2013,11 @@ class Game:
                 self._tints[tint_index] = layer
             screen.blit(layer, (0, 0))
         self.hud.draw(screen, self)
+        if self.coop_active:
+            self._draw_player_tags(screen)
+            self._draw_net_badge(screen)
+            if not self.player.alive:
+                self._draw_spectator_banner(screen)
         if self.boss_menu and self.state == STATE_PLAYING:
             self._draw_boss_menu(screen)
         if self.state == STATE_SHOP:
@@ -1523,12 +2027,499 @@ class Game:
         elif self.state in (STATE_PAUSED, STATE_SETTINGS, STATE_DIFFICULTY):
             self.hud.draw_pause_menu(screen, self)
 
+    # ------------------------------------------------------------ ОНЛАЙН
+    def open_online(self):
+        # Отдельный экран: одиночная игра не запускается автоматически.
+        self.online_ui.reset()
+        self.state = STATE_ONLINE
+
+    def online_host(self):
+        # Создать игру = открыть TCP-порт и ждать подключений.
+        self.online_leave()
+        try:
+            self.session = HostSession(self.local_name, protocol.DEFAULT_PORT)
+        except OSError as exc:
+            self.online_ui.error = f'Не удалось открыть порт: {exc}'
+            return False
+        self.net_role = 'host'
+        return True
+
+    def online_join(self, address):
+        # Подключение идёт в фоновом потоке сессии, экран показывает статус.
+        if not address:
+            self.online_ui.error = 'Введите адрес хоста'
+            return False
+        self.online_leave()
+        self.session = ClientSession(address, 'Гость')
+        self.net_role = 'client'
+        return True
+
+    def online_leave(self):
+        session = getattr(self, 'session', None)
+        if session is not None:
+            try:
+                session.close()
+            except OSError:
+                pass
+        self.session = None
+        self.net_role = None
+        self.client_view = None
+        self.coop_active = False
+        if getattr(self, 'player', None) is not None:
+            self.players = [self.player]
+            self.remote_players = []
+
+    def pump_online(self, dt):
+        # Кадр экрана «Онлайн»: только сеть и отрисовка, мир не живёт.
+        session = self.session
+        if session is None:
+            self.online_ui.sync(self)
+            return
+        if self.net_role == 'host':
+            session.accept_handshakes()
+            session.pump(self, dt)
+        else:
+            for kind, payload in session.pump():
+                if kind == 'start':
+                    self.start_coop_client(payload)
+                    return
+                if kind == 'notice':
+                    self.toast(str(payload.get('text', '')),
+                               float(payload.get('timer', 2.4)),
+                               tuple(payload.get('color') or
+                                     (255, 220, 140)))
+                elif kind == 'buy_result':
+                    self.toast(str(payload.get('text', '')), 2.6,
+                               (140, 236, 170) if payload.get('ok')
+                               else (240, 140, 120))
+        self.online_ui.sync(self)
+
+    def start_coop_host(self):
+        if self.net_role != 'host' or self.session is None:
+            return False
+        if self.session.status != 'waiting':
+            return False
+        self.session.start_run(self)
+        return True
+
+    def start_coop_run(self, clients):
+        # Один seed на всех: клиенты построят тот же сектор сами.
+        self.local_pid = 1
+        seed = random.SystemRandom().randrange(0, 2 ** 63)
+        self.reset(seed=seed)
+        self.net_role = 'host'
+        self.coop_active = True
+        self.player.is_local = True
+        self.player.name = self.local_name
+        start_x, start_y = self.world.player_start()
+        self.players = [self.player]
+        for index, client in enumerate(clients):
+            offset = 44.0 * ((index + 2) // 2)
+            side = 1.0 if index % 2 == 0 else -1.0
+            px, py = self.world.resolve_circle(
+                start_x + offset * side, start_y + offset * 0.5,
+                getattr(self.player, 'radius', 14))
+            player = Player(px, py)
+            player.pid = client.pid
+            player.is_local = False
+            player.name = client.name
+            client.player = player
+            self.players.append(player)
+        self.remote_players = [p for p in self.players if p is not self.player]
+        self.render_players = self.players
+        self.state = STATE_PLAYING
+        self.toast(f'КООПЕРАТИВ · участников {len(self.players)}', 4.0,
+                   color=(150, 226, 210))
+        return self.seed, self.depth, self.zone_key
+
+    def start_coop_client(self, payload):
+        # Клиент получает общий seed и строит тот же мир локально.
+        self.net_role = 'client'
+        self.coop_active = True
+        self.local_pid = int(getattr(self.session, 'pid', 2) or 2)
+        self.reset(seed=int(payload.get('seed', 0)), warm_chunks=False)
+        self.net_role = 'client'
+        self.coop_active = True
+        self.player.is_local = True
+        self.player.name = getattr(self.session, 'player_name', 'Гость')
+        self.client_view = ClientView(self)
+        self.client_view.local_pid = self.local_pid
+        self.state = STATE_PLAYING
+        self.toast('ПОДКЛЮЧЕНО · ждём снимок мира', 2.4,
+                   color=(150, 226, 210))
+
+    def rebuild_client_world(self, seed, depth, zone):
+        # Геометрия сектора воспроизводится из seed тем же кодом, что у хоста.
+        self.seed = int(seed)
+        self.zone_key = zone
+        self.zone_prev = zone
+        self.depth = int(depth)
+        self.world = World(seed=self.seed, zone_key=zone, prefetch=False)
+        start_x, start_y = self.world.player_start()
+        self._begin_client_warm(start_x, start_y)
+        self.exploration = Exploration(self.world)
+        self.descent = DescentManager(self, self.depth)
+        self.lighting = LightingManager()
+        self.elapsed = 0.0
+        self.spawn_timer = SPAWN_FIRST_DELAY
+        self.camera.reset_shake()
+        self._sync_shops()
+
+    # ------------------------------------------- КЛИЕНТ: МИР ПОРЦИЯМИ
+    def _begin_client_warm(self, start_x, start_y):
+        """Очередь генерации чанков вокруг старта нового сектора.
+
+        Клиенту мир нужен только для картинки и коллизий взгляда, поэтому
+        строить его можно кадр за кадром. Хост этого не делает: у него
+        симуляция и полный мир нужны сразу.
+        """
+        world = self.world
+        cx = math.floor(start_x / world.chunk_pixels)
+        cy = math.floor(start_y / world.chunk_pixels)
+        # Радиус 3 (49 чанков): в кадре видно ~2x2, остальное — запас,
+        # чтобы при движении чанки не генерировались в бою.
+        queue = [(cx + dx, cy + dy)
+                 for dy in range(-3, 4) for dx in range(-3, 4)]
+        queue.sort(key=lambda chunk: abs(chunk[0] - cx) + abs(chunk[1] - cy))
+        self._warm_queue = queue
+        self._warm_total = len(queue)
+        self._warm_loading = True
+
+    def _warm_client_world(self):
+        """Генерирует 1-2 чанка за кадр вместо одного длинного фриза."""
+        queue = getattr(self, "_warm_queue", None)
+        if not queue:
+            if getattr(self, "_warm_loading", False):
+                self._warm_loading = False
+            return
+        deadline = time.perf_counter() + 0.012
+        generated = 0
+        while queue and generated < 2:
+            chunk = queue.pop(0)
+            if chunk in self.world._chunks:
+                continue
+            self.world._generate_chunk(*chunk)
+            generated += 1
+            if time.perf_counter() >= deadline:
+                break
+        if not queue:
+            self._warm_loading = False
+
+    def _draw_world_sync(self, screen):
+        screen.fill((8, 11, 17))
+        width, height = screen.get_size()
+        total = max(1, getattr(self, "_warm_total", 1))
+        left = len(getattr(self, "_warm_queue", []))
+        progress = 1.0 - left / total
+        visuals.text(screen, "СИНХРОНИЗАЦИЯ СЕКТОРА",
+                     (width // 2, height // 2 - 44), 30,
+                     (222, 232, 240), align="center")
+        bar_w, bar_h = min(420, width - 160), 10
+        x, y = (width - bar_w) // 2, height // 2 + 4
+        pygame.draw.rect(screen, (28, 38, 50), (x, y, bar_w, bar_h),
+                         border_radius=5)
+        pygame.draw.rect(screen, (110, 210, 190),
+                         (x, y, int(bar_w * progress), bar_h),
+                         border_radius=5)
+        visuals.text(screen, "мир строится локально · сеть не ждёт",
+                     (width // 2, y + 32), 16, (130, 150, 165),
+                     align="center")
+
+    def snapshot_payload(self):
+        return net_snapshot.build(self)
+
+    def _pump_client_events(self):
+        session = self.session
+        if session is None:
+            return
+        for kind, payload in session.pump():
+            if kind == 'closed':
+                self.online_ui.screen = 'error'
+                self.online_ui.error = (session.error or payload or
+                                        'Хост завершил сессию')
+                self.session = None
+                self.net_role = None
+                self.coop_active = False
+                self.client_view = None
+                self.state = STATE_ONLINE
+                return
+            if kind == 'notice':
+                self.toast(str(payload.get('text', '')),
+                           float(payload.get('timer', 2.4)),
+                           tuple(payload.get('color') or (255, 220, 140)))
+            elif kind == 'buy_result':
+                self.toast(str(payload.get('text', '')), 2.6,
+                           (140, 236, 170) if payload.get('ok')
+                           else (240, 140, 120))
+            elif kind == 'error':
+                self.toast(str(payload), 3.0, (240, 140, 120))
+
+    def _apply_snapshot(self):
+        session = self.session
+        view = self.client_view
+        if session is None or view is None or session.snapshot is None:
+            return
+        view.local_pid = self.local_pid
+        view.apply(session.snapshot)
+
+    def _client_update(self, dt):
+        self.elapsed += dt
+        # Красная вспышка урона — клиентская реакция, гасим её сами.
+        self.damage_flash = max(0.0, self.damage_flash - dt * 3.0)
+        self.camera.update(dt)
+        self._pump_client_events()
+        if self.session is None:
+            return
+        self._apply_snapshot()
+        if self.client_view is not None:
+            self.client_view.update(dt)
+        self._warm_client_world()
+        self._sync_shops()
+        self._update_spectator_input()
+        view = self.view_player()
+        if view is not None:
+            self.camera.follow(view.x, view.y)
+        self._send_client_input(dt)
+        self._sync_camera_zoom()
+
+    def _client_pump_only(self, dt):
+        # Клиент с открытым окном (пауза/магазин) продолжает принимать снимки.
+        self.elapsed += dt
+        self.damage_flash = max(0.0, self.damage_flash - dt * 3.0)
+        self._pump_client_events()
+        if self.session is None:
+            return
+        self._apply_snapshot()
+        if self.client_view is not None:
+            self.client_view.update(dt)
+        self._warm_client_world()
+        self._sync_shops()
+        self._update_spectator_input()
+        view = self.view_player()
+        if view is not None:
+            self.camera.follow(view.x, view.y)
+        self.camera.update(dt)
+        self._send_client_input(dt, idle_only=True)
+
+    def _send_client_input(self, dt, idle_only=False):
+        session = self.session
+        if session is None or session.status != 'playing':
+            return
+        self._online_input_timer += dt
+        if self._online_input_timer < 1.0 / netplay.INPUT_HZ:
+            return
+        self._online_input_timer = 0.0
+        if idle_only or self.player is None or not self.player.alive:
+            player = self.player
+            session.send_input(
+                (0.0, 0.0),
+                player.angle if player else 0.0,
+                (player.x, player.y) if player else (0.0, 0.0),
+                False, False, [])
+            self._online_actions.clear()
+            return
+        keys = pygame.key.get_pressed()
+        dx = (1 if keys[pygame.K_d] or keys[pygame.K_RIGHT] else 0) - (
+            1 if keys[pygame.K_a] or keys[pygame.K_LEFT] else 0)
+        dy = (1 if keys[pygame.K_s] or keys[pygame.K_DOWN] else 0) - (
+            1 if keys[pygame.K_w] or keys[pygame.K_UP] else 0)
+        mouse_world = self.camera.to_world(*pygame.mouse.get_pos())
+        angle = math.atan2(mouse_world[1] - self.player.y,
+                           mouse_world[0] - self.player.x)
+        buttons = pygame.mouse.get_pressed()
+        actions, self._online_actions = self._online_actions, []
+        session.send_input((dx, dy), angle, mouse_world,
+                           buttons[0], buttons[2], actions)
+
+    def _client_key(self, key):
+        # Клиент превращает нажатия в НАМЕРЕНИЯ, а не в локальные действия.
+        if key == pygame.K_F3:
+            self.debug_visible = not self.debug_visible
+            return
+        if key in (pygame.K_t, pygame.K_y):
+            # Доска открывается локально на ЗЕРКАЛЕ прогрессии, а
+            # покупку проверяет и применяет хост.
+            self.open_tree('firearm' if key == pygame.K_t else 'melee')
+            return
+        if key == pygame.K_e:
+            if self.try_open_shop():
+                return
+            self._online_actions.append('interact')
+            return
+        actions = {
+            pygame.K_SPACE: 'dash',
+            pygame.K_r: 'reload',
+            pygame.K_q: 'grenade',
+            pygame.K_g: 'medkit',
+            pygame.K_f: 'artifact',
+            pygame.K_x: 'melee_ability',
+            pygame.K_v: 'cycle_mode',
+        }
+        action = actions.get(key)
+        if action is not None:
+            self._online_actions.append(action)
+
+    def _apply_remote_input(self, client):
+        player = client.player
+        if player is None:
+            return
+        state = client.input_state
+        if not player.alive:
+            player.move_dir = (0.0, 0.0)
+            player.trigger_held = False
+            player.melee_held = False
+            state['actions'] = []
+            return
+        player.move_dir = state['move']
+        player.angle = state['aim']
+        player.aim_pos = (state['aim_x'], state['aim_y'])
+        player.trigger_held = state['fire']
+        player.melee_held = state['melee']
+        for action in state['actions']:
+            self._run_player_action(player, action)
+        state['actions'] = []
+
+    def _run_player_action(self, player, action):
+        if action == 'dash':
+            player.start_dash()
+        elif action == 'reload':
+            player.start_reload()
+        elif action == 'grenade':
+            player.throw_grenade(self)
+        elif action == 'medkit':
+            player.use_medkit(self)
+        elif action == 'artifact':
+            player.use_artifact(self)
+        elif action == 'melee_ability':
+            self.use_melee_ability(player)
+        elif action == 'cycle_mode':
+            player.cycle_firearm_mode(self)
+        elif action == 'interact':
+            if not self.descent.interact(self, player):
+                self.exploration.open_nearest(self, player)
+
+    @contextmanager
+    def _as_player(self, player):
+        # Магазин и дерево навыков написаны вокруг одного hero.
+        # На время покупки подменяем его покупателем и восстанавливаем
+        # в finally — никакой «расщеплённой» логики в shop_ui не нужно.
+        original = self.player
+        self.player = player
+        try:
+            yield
+        finally:
+            self.player = original
+
+    def purchase_for(self, player, shop_position, cursor, kind=None,
+                     key=None):
+        if player is None:
+            return False, 'Нет игрока'
+        if not player.alive:
+            return False, 'Павший не торгует'
+        shop = shop_near(self.shops, shop_position)
+        if shop is None:
+            return False, 'Магазин не найден'
+        if distance(player.x, player.y, shop.x, shop.y) > SHOP_OPEN_DIST + 44:
+            return False, 'Слишком далеко от магазина'
+        with self._as_player(player):
+            self.shop_ui.active_shop = shop
+            items = self.shop_ui._items(self)
+            if not items:
+                return False, 'Витрина пуста'
+            if cursor < 0 or cursor >= len(items):
+                return False, 'Товара нет'
+            offer = items[cursor]
+            # Клиент называет товар, который видел. Если витрины разошлись,
+            # покупка отклоняется, а не превращается в другой предмет.
+            if kind and offer.get('kind') != kind:
+                return False, 'Витрина изменилась'
+            if key and offer.get('key') != key:
+                return False, 'Витрина изменилась'
+            handler = BUY_HANDLERS.get(offer['kind'])
+            if handler is None:
+                return False, 'Товар недоступен'
+            ok, text = handler(self, offer)
+        soundbank.play('buy' if ok else 'error')
+        return ok, text
+
+    def purchase_skill(self, player, zone, node_id):
+        # Повторная проверка ВСЕГО на хосте: строку доски строит его
+        # собственный интерфейс по его состоянию героя, поэтому цена,
+        # подготовка и вторая ветвь не могут быть подделаны клиентом.
+        if player is None:
+            return False, 'Нет игрока'
+        if not player.alive:
+            return False, 'Павший не учится'
+        with self._as_player(player):
+            ui = self.skill_ui
+            rows = ui.rows(self)
+            row = next((item for item in rows
+                        if item['zone'] == zone
+                        and item['node']['id'] == node_id), None)
+            if row is None:
+                return False, 'Навык не найден'
+            before = player.money
+            ui.selected_key = (zone, node_id)
+            ui.focus_zone = zone
+            ui.buy(self)
+            owned = (zone == 'player' and node_id in player.skill_nodes)
+            ok = player.money < before or owned
+            text = ui.message or ('Навык изучен' if ok else 'Недоступно')
+        return ok, text
+
+    def _draw_spectator_banner(self, screen):
+        """Павший видит, за кем смотрит и как переключаться."""
+        view = self.view_player()
+        if view is self.player:
+            return
+        rect = pygame.Rect(WIDTH // 2 - 232, 18, 464, 74)
+        layer = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+        layer.fill((14, 12, 22, 218))
+        pygame.draw.rect(layer, (128, 104, 176), layer.get_rect(), 1,
+                         border_radius=10)
+        screen.blit(layer, rect.topleft)
+        visuals.text(screen, "НАБЛЮДЕНИЕ", (rect.centerx, rect.y + 8), 15,
+                     (186, 160, 236), align="center")
+        visuals.text(screen, f"камера: {view.name}", (rect.centerx, rect.y + 26),
+                     21, (238, 230, 255), align="center")
+        ratio = max(0.0, min(1.0, view.hp / max(1.0, view.max_hp)))
+        visuals.bar(screen, pygame.Rect(rect.x + 26, rect.y + 52, 250, 6),
+                    ratio, (126, 220, 150), (26, 30, 42))
+        visuals.text(screen, "A / D — сменить", (rect.right - 26, rect.y + 46),
+                     15, (170, 160, 196), align="right")
+
+    def _draw_player_tags(self, screen):
+        for player in self.players:
+            if player is self.player or not player.alive:
+                continue
+            if not self.camera.is_visible(player.x, player.y):
+                continue
+            sx, sy = self.camera.to_screen(player.x, player.y)
+            if not (-80 < sx < WIDTH + 80 and -80 < sy < HEIGHT + 80):
+                continue
+            visuals.text(screen, player.name, (sx, sy - 40), 14,
+                         (150, 226, 214), align='center')
+            width = 46
+            ratio = max(0.0, min(1.0, player.hp / max(1.0, player.max_hp)))
+            x = int(sx - width / 2)
+            y = int(sy - 30)
+            pygame.draw.rect(screen, (12, 16, 24), (x, y, width, 4))
+            pygame.draw.rect(screen, (86, 208, 118),
+                             (x, y, int(width * ratio), 4))
+
+    def _draw_net_badge(self, screen):
+        role = 'ХОСТ' if self.net_role == 'host' else 'КЛИЕНТ'
+        visuals.text(screen,
+                     f'ОНЛАЙН · {role} · игроков {len(self.players)}',
+                     (WIDTH - 16, 12), 14, (128, 210, 200),
+                     align='right')
+
     def _draw_boss_menu(self, screen):
         """Алтарь призыва: карточки боссов вместо голого списка."""
         dim = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         dim.fill((4, 7, 12, 170))
         screen.blit(dim, (0, 0))
-        w, h = 700, 400
+        w, h = 700, 500
         x, y = (WIDTH - w) // 2, (HEIGHT - h) // 2
         panel = pygame.Surface((w, h), pygame.SRCALPHA)
         panel.fill((13, 17, 27, 242))

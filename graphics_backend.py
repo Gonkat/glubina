@@ -17,7 +17,6 @@ OpenGL растягивает её на окно и при желании доб
 """
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import subprocess
@@ -28,14 +27,9 @@ from pathlib import Path
 
 import pygame
 
+from render import CPUDisplay, OpenGLPresenter
+from render_metrics import FrameMetrics
 from settings import HEIGHT, WIDTH
-
-try:  # PyOpenGL остаётся необязательным: без него игра идёт через CPU.
-    from OpenGL import GL
-    from OpenGL.GL import shaders
-except Exception:  # pragma: no cover - зависит от машины
-    GL = None
-    shaders = None
 
 
 # ------------------------------------------------------------------ адаптеры
@@ -188,198 +182,6 @@ def _set_windows_gpu_preference(preference: int) -> tuple[bool, str]:
     return True, "Предпочтение GPU применено."
 
 
-# ------------------------------------------------------------- OpenGL frame
-_VERTEX_SHADER = """
-#version 120
-attribute vec2 a_pos;
-varying vec2 v_uv;
-void main() {
-    // Текстура загружается сверху вниз (BGRA из Surface), поэтому V
-    // инвертируется здесь, а не лишним копированием пикселей.
-    v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-"""
-
-_FRAGMENT_SHADER = """
-#version 120
-uniform sampler2D u_scene;
-uniform vec2 u_texel;
-uniform float u_effects;
-varying vec2 v_uv;
-
-void main() {
-    vec3 color = texture2D(u_scene, v_uv).rgb;
-    if (u_effects > 0.5) {
-        vec3 b = texture2D(u_scene, v_uv + vec2(-2.0 * u_texel.x, 0.0)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(2.0 * u_texel.x, 0.0)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(0.0, -2.0 * u_texel.y)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(0.0, 2.0 * u_texel.y)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(-1.5 * u_texel.x, 1.5 * u_texel.y)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(1.5 * u_texel.x, 1.5 * u_texel.y)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(-1.5 * u_texel.x, -1.5 * u_texel.y)).rgb;
-        b += texture2D(u_scene, v_uv + vec2(1.5 * u_texel.x, -1.5 * u_texel.y)).rgb;
-        b *= 0.125;
-        float light = dot(b, vec3(0.299, 0.587, 0.114));
-        color += b * smoothstep(0.58, 0.96, light) * 0.22;
-    }
-    gl_FragColor = vec4(color, 1.0);
-}
-"""
-
-
-def _gl_string(name: int) -> str:
-    try:
-        value = GL.glGetString(name)
-    except Exception:
-        return ""
-    if not value:
-        return ""
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
-
-
-class OpenGLPresenter:
-    """Загружает готовый Surface в GPU-текстуру и рисует его на окне."""
-
-    def __init__(self, size: tuple[int, int], effects: bool = True):
-        if GL is None or shaders is None:
-            raise RuntimeError("PyOpenGL не установлен")
-        self.size = (int(size[0]), int(size[1]))
-        self.surface = pygame.Surface(self.size)
-        self.effects = bool(effects)
-        self._closed = False
-
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
-        pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-        pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
-        pygame.display.set_mode(
-            self.size, pygame.OPENGL | pygame.DOUBLEBUF
-        )
-
-        self.name = _gl_string(GL.GL_RENDERER) or "OpenGL"
-        self.version = _gl_string(GL.GL_VERSION)
-        self.vendor = _gl_string(GL.GL_VENDOR)
-        self._init_gl()
-
-    def _init_gl(self):
-        GL.glViewport(0, 0, self.size[0], self.size[1])
-        GL.glDisable(GL.GL_DEPTH_TEST)
-        GL.glDisable(GL.GL_BLEND)
-        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-
-        vertex = shaders.compileShader(_VERTEX_SHADER, GL.GL_VERTEX_SHADER)
-        fragment = shaders.compileShader(_FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER)
-        self._program = shaders.compileProgram(vertex, fragment)
-        GL.glUseProgram(self._program)
-        masks = self.surface.get_masks()
-        self._raw_bgra = self.surface.get_bytesize() == 4 and masks[:3] == (
-            0x00FF0000, 0x0000FF00, 0x000000FF,
-        )
-
-        self._texture = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexImage2D(
-            GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8,
-            self.size[0], self.size[1], 0,
-            GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None,
-        )
-
-        self._quad = (ctypes.c_float * 8)(
-            -1.0, -1.0,
-            1.0, -1.0,
-            -1.0, 1.0,
-            1.0, 1.0,
-        )
-        self._vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
-        GL.glBufferData(
-            GL.GL_ARRAY_BUFFER, ctypes.sizeof(self._quad),
-            self._quad, GL.GL_STATIC_DRAW,
-        )
-        self._pos = GL.glGetAttribLocation(self._program, "a_pos")
-        self._scene = GL.glGetUniformLocation(self._program, "u_scene")
-        self._texel = GL.glGetUniformLocation(self._program, "u_texel")
-        self._effects_loc = GL.glGetUniformLocation(self._program, "u_effects")
-        if self._pos >= 0:
-            GL.glEnableVertexAttribArray(self._pos)
-        GL.glUniform1i(self._scene, 0)
-        GL.glUniform2f(
-            self._texel,
-            1.0 / max(1, self.size[0]), 1.0 / max(1, self.size[1]),
-        )
-        self._closed = False
-
-    def set_effects(self, enabled: bool):
-        self.effects = bool(enabled)
-
-    def present(self):
-        if self._closed:
-            return
-        if self._raw_bgra:
-            # Surface уже лежит как BGRA; .raw копирует без перекодирования.
-            pixels = self.surface.get_buffer().raw
-            pixel_format = GL.GL_BGRA
-        else:
-            pixels = pygame.image.tostring(self.surface, "RGBA", False)
-            pixel_format = GL.GL_RGBA
-        GL.glClearColor(0.0, 0.0, 0.0, 1.0)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-        GL.glUseProgram(self._program)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
-        GL.glTexSubImage2D(
-            GL.GL_TEXTURE_2D, 0, 0, 0,
-            self.size[0], self.size[1],
-            pixel_format, GL.GL_UNSIGNED_BYTE, pixels,
-        )
-        GL.glUniform1f(self._effects_loc, 1.0 if self.effects else 0.0)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
-        if self._pos >= 0:
-            GL.glEnableVertexAttribArray(self._pos)
-            GL.glVertexAttribPointer(
-                self._pos, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None
-            )
-        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
-        pygame.display.flip()
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            GL.glDeleteBuffers(1, [self._vbo])
-            GL.glDeleteTextures([self._texture])
-            GL.glDeleteProgram(self._program)
-        except Exception:
-            pass
-
-
-class CPUDisplay:
-    """Обычный SDL-дисплей: тот же путь, что был до OpenGL."""
-
-    name = "CPU (SDL)"
-    version = ""
-    vendor = ""
-
-    def __init__(self, size=(WIDTH, HEIGHT)):
-        self.surface = pygame.display.set_mode(tuple(size))
-        self.effects = False
-
-    def set_effects(self, enabled: bool):
-        self.effects = bool(enabled)
-
-    def present(self):
-        pygame.display.flip()
-
-    def close(self):
-        pass
-
-
 # ------------------------------------------------------------------ manager
 DEFAULT_CONFIG = {
     "renderer": "opengl",
@@ -393,9 +195,12 @@ class VideoManager:
     """Владеет окном, OpenGL-презентером и сохранённым выбором GPU."""
 
     def __init__(self, width: int = WIDTH, height: int = HEIGHT,
-                 config_path: str | os.PathLike | None = None):
+                 config_path: str | os.PathLike | None = None,
+                 metrics: FrameMetrics | None = None):
         self.width = int(width)
         self.height = int(height)
+        # Один сборщик на игру: игра пишет update/draw, презентер — present.
+        self.metrics = metrics if metrics is not None else FrameMetrics()
         self.config_path = Path(config_path) if config_path else (
             Path(__file__).with_name("video_settings.json")
         )
@@ -454,7 +259,8 @@ class VideoManager:
         if requested == "opengl" and not self._headless():
             try:
                 presenter = OpenGLPresenter(
-                    (self.width, self.height), effects=self.effects
+                    (self.width, self.height), effects=self.effects,
+                    metrics=self.metrics,
                 )
             except Exception as exc:  # PyOpenGL/драйвер/контекст
                 self.last_error = f"OpenGL недоступен: {exc}"
@@ -470,7 +276,9 @@ class VideoManager:
                 return
 
         try:
-            display = CPUDisplay((self.width, self.height))
+            display = CPUDisplay(
+                (self.width, self.height), metrics=self.metrics
+            )
         except Exception as exc:
             self.last_error = f"Не удалось открыть окно: {exc}"
             raise

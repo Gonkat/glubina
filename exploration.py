@@ -5,6 +5,7 @@ import random
 import pygame
 import spritebank
 import visuals
+from utils import fade_draw
 
 
 class Exploration:
@@ -27,8 +28,10 @@ class Exploration:
                     sites[site["id"]] = site
         self.sites = sites
 
-    def open_nearest(self, game):
-        player = game.player
+    def open_nearest(self, game, player=None):
+        # Сундук открывает конкретный участник: в кооперативе это
+        # может быть не хост, и награда должна достаться ему.
+        player = game.player if player is None else player
         candidates = [site for site in self.sites.values()
                       if site["id"] not in self.opened
                       and (site["x"] - player.x) ** 2 + (site["y"] - player.y) ** 2 < 105 ** 2]
@@ -41,7 +44,7 @@ class Exploration:
         rarity = self.rarity(site)
         scale = {"common": 1, "rare": 2, "legendary": 4}[rarity]
         money = rng.randint(30, 100) * scale
-        game.money += money
+        player.money += money
         rewards.append(f"{money} монет")
         if rng.random() < 0.8:
             ammo = rng.randint(8, 25) * scale
@@ -107,30 +110,54 @@ class Exploration:
             weapon.attack.mods["shock_slow"] = max(weapon.attack.mods.get("shock_slow", 0), 2.0)
         rewards.append(f"реликвия {weapon.name}: {relic}")
 
-    def draw(self, screen, camera, player):
-        """Физические сундуки: до темноты, чтобы свет их подсвечивал."""
+    def draw(self, screen, camera, player, visible=None):
+        """
+        Физические сундуки: до темноты, чтобы свет их подсвечивал.
+
+        visible(x, y) возвращает прозрачность 0..1 (свет × мягкие
+        стены) — сундуки гаснут у края света плавно, а не рывком.
+        """
         for site in self.sites.values():
+            a = 1.0 if visible is None else visible(site["x"], site["y"])
+            if a <= 0.01:
+                continue
             x, y = camera.to_screen(site["x"], site["y"])
             if not (-60 < x < screen.get_width() + 60 and -60 < y < screen.get_height() + 60):
                 continue
-            opened = site["id"] in self.opened
-            rarity = self.rarity(site)
-            palette = {"common": (194, 135, 59), "rare": (116, 177, 221),
-                       "legendary": (237, 196, 68)}
-            color = (93, 91, 91) if opened else palette[rarity]
-            chest = spritebank.get_scaled("chest/opened" if opened else "chest/" + rarity, (40, 30))
-            if chest is not None:
-                screen.blit(chest, chest.get_rect(center=(x, y)))
-            else:
-                pygame.draw.rect(screen, (29, 23, 18), (x - 19, y - 13, 38, 27), border_radius=4)
-                pygame.draw.rect(screen, color, (x - 17, y - 11, 34, 23), border_radius=3)
-                pygame.draw.rect(screen, (245, 206, 105) if not opened else (64, 64, 64),
-                                 (x - 3, y - 9, 6, 20))
 
-    def draw_overlay(self, screen, camera, player):
-        """Метки и подсказки поверх темноты — только у ближних точек."""
+            def draw_chest(site=site, x=x, y=y):
+                opened = site["id"] in self.opened
+                rarity = self.rarity(site)
+                palette = {"common": (194, 135, 59), "rare": (116, 177, 221),
+                           "legendary": (237, 196, 68)}
+                color = (93, 91, 91) if opened else palette[rarity]
+                chest = spritebank.get_scaled(
+                    "chest/opened" if opened else "chest/" + rarity, (40, 30))
+                if chest is not None:
+                    screen.blit(chest, chest.get_rect(center=(x, y)))
+                else:
+                    pygame.draw.rect(screen, (29, 23, 18),
+                                     (x - 19, y - 13, 38, 27), border_radius=4)
+                    pygame.draw.rect(screen, color,
+                                     (x - 17, y - 11, 34, 23), border_radius=3)
+                    pygame.draw.rect(
+                        screen,
+                        (245, 206, 105) if not opened else (64, 64, 64),
+                        (x - 3, y - 9, 6, 20))
+
+            fade_draw(screen, x, y, a, draw_chest, margin=60)
+
+    def draw_overlay(self, screen, camera, player, visible=None):
+        """
+        Метки и подсказки поверх темноты — только у ближних точек.
+
+        Как и сами сундуки, метки гаснут плавно по прозрачности visible.
+        """
         for site in self.sites.values():
             if site["id"] in self.opened:
+                continue
+            a = 1.0 if visible is None else visible(site["x"], site["y"])
+            if a <= 0.01:
                 continue
             d2 = (site["x"] - player.x) ** 2 + (site["y"] - player.y) ** 2
             if d2 > 820 ** 2:
@@ -138,19 +165,25 @@ class Exploration:
             x, y = camera.to_screen(site["x"], site["y"])
             if not (-60 < x < screen.get_width() + 60 and -60 < y < screen.get_height() + 60):
                 continue
-            rarity = self.rarity(site)
-            palette = {"common": (222, 168, 82), "rare": (110, 190, 236),
-                       "legendary": (255, 210, 70)}
-            color = palette[rarity]
-            pulse = 1.0 + 0.12 * math.sin(pygame.time.get_ticks() / 260 + site["x"] * 0.01)
-            pygame.draw.polygon(screen, color, [
-                (x, y - 30 - 4 * pulse), (x + 5, y - 25), (x, y - 20),
-                (x - 5, y - 25),
-            ])
-            if d2 < 340 ** 2:
-                label = (self.LABELS[site["kind"]] + " · " +
-                         self.rarity_label(rarity))
-                visuals.text(screen, label, (x, y - 48), 16, color, align="center")
+
+            def draw_mark(site=site, x=x, y=y, d2=d2):
+                rarity = self.rarity(site)
+                palette = {"common": (222, 168, 82), "rare": (110, 190, 236),
+                           "legendary": (255, 210, 70)}
+                color = palette[rarity]
+                pulse = 1.0 + 0.12 * math.sin(
+                    pygame.time.get_ticks() / 260 + site["x"] * 0.01)
+                pygame.draw.polygon(screen, color, [
+                    (x, y - 30 - 4 * pulse), (x + 5, y - 25), (x, y - 20),
+                    (x - 5, y - 25),
+                ])
+                if d2 < 340 ** 2:
+                    label = (self.LABELS[site["kind"]] + " · " +
+                             self.rarity_label(rarity))
+                    visuals.text(screen, label, (x, y - 48), 16, color,
+                                 align="center")
+
+            fade_draw(screen, x, y, a, draw_mark, margin=64)
         if self.notice and pygame.time.get_ticks() < self.notice_until:
             width = visuals.text_width(self.notice, 18) + 36
             background = pygame.Rect(screen.get_width() // 2 - width // 2, 46,

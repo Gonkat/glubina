@@ -6,6 +6,7 @@ from collections import OrderedDict
 import pygame
 import spritebank
 import visuals
+import zones
 
 from settings import (
     CHUNK_CACHE_LIMIT,
@@ -42,7 +43,8 @@ class World:
     WALL = 1
     MAX_WALL_RUN = 6
 
-    def __init__(self, seed=None, passage_radius=None):
+    def __init__(self, seed=None, passage_radius=None, zone_key="medium",
+                 prefetch=True):
         radius = TILE * 0.65 if passage_radius is None else passage_radius
         if not math.isfinite(radius) or radius < 0:
             raise ValueError("passage_radius должен быть конечным и неотрицательным")
@@ -53,12 +55,34 @@ class World:
         if CHUNK_TILES < 2 * self._clearance + 10:
             raise ValueError("Чанк слишком мал для заданного passage_radius")
         self.seed = random.SystemRandom().randrange(0, 2**63) if seed is None else seed
+        # Тип локации (биом) задаёт и свет, и ГЕНЕРАЦИЮ: плотность/размер
+        # комнат, захламлённость, декор пола, палитру и число ламп.
+        # Назначается ДО первой генерации чанка (см. Game.reset /
+        # descend_to_next), поэтому все чанки сектора — одного биома.
+        self.zone_key = zone_key
+        self.zone = zones.profile(zone_key)
+        self.gen = {
+            "rooms": float(self.zone.get("gen_rooms", 1.0)),
+            "room_size": float(self.zone.get("gen_room_size", 1.0)),
+            "obstacles": float(self.zone.get("gen_obstacles", 1.0)),
+            "props": float(self.zone.get("gen_props", 1.0)),
+            "decor": str(self.zone.get("gen_decor", "classic")),
+            "floor_tint": self.zone.get("gen_floor_tint", ((0, 0, 0), 0.0)),
+            "lamp_palette": self.zone.get("lamp_palette"),
+            "lamp_max": max(1, int(self.zone.get("lamp_max", 6))),
+            # Гарантированный минимум источников на чанк: комнат в чанке
+            # меньше одной, и уютный сектор без этого читался бы тёмным.
+            "lamp_min": max(0, int(self.zone.get("lamp_min", 0))),
+        }
         self.chunk_pixels = CHUNK_TILES * TILE
         self._chunks = OrderedDict()
         self._shop_spots = OrderedDict()
         self._plans = OrderedDict()
-        self._generate_chunk(0, 0)
-        self.ensure_chunks_around(*self.player_start(), radius_chunks=1)
+        # Клиент рисует мир сам и не должен строить 9 чанков в одном кадре:
+        # prefetch=False оставляет генерацию на пошаговый обогрев.
+        if prefetch:
+            self._generate_chunk(0, 0)
+            self.ensure_chunks_around(*self.player_start(), radius_chunks=1)
 
     @property
     def shop_spots(self):
@@ -166,11 +190,15 @@ class World:
         )
         occupied = [starter] if key == (0, 0) else []
         rooms = []
-        min_size = max(7, self._clearance * 2 + 5, ROOM_MIN_SIZE)
-        max_size = min(max(min_size, ROOM_MAX_SIZE), 14, size - 2 * margin)
+        room_size = self.gen["room_size"]
+        min_size = max(7, self._clearance * 2 + 5,
+                       int(round(ROOM_MIN_SIZE * room_size)))
+        max_size = min(max(min_size, int(round(ROOM_MAX_SIZE * room_size))),
+                       14, size - 2 * margin)
+        room_target = max(1, int(size * size // 210 * self.gen["rooms"]))
         clusters = [(rng.randrange(size), rng.randrange(size)) for _ in range(2)]
         for _ in range(max(0, ROOM_ATTEMPTS)):
-            if len(rooms) >= max(1, size * size // 210) or min_size > max_size:
+            if len(rooms) >= room_target or min_size > max_size:
                 break
             width, height = rng.randint(min_size, max_size), rng.randint(min_size, max_size)
             if rng.random() < 0.65:
@@ -255,28 +283,42 @@ class World:
         Точки света в комнатах. Свет — не декор: он показывает границы
         комнаты и даёт игроку ориентир, куда идти. Расположение
         детерминировано (seed чанка), поэтому не «мигает» при перезаходе.
+
+        Профиль локации (self.zone) управляет шансом ламп, радиусами и
+        весами профилей мерцания; отдельно с редким шансом ставятся
+        фонарные столбы — уютные островки света в тёмных секторах.
         """
+        prof = self.zone
         rng = self._rng(chunk_x, chunk_y, "lamps-v1")
-        palette = ((255, 174, 96), (110, 206, 214), (255, 210, 150),
-                   (150, 190, 255))
+        # Палитра биома: тёмный — холодные кристаллы, уютный — тёплый свет.
+        palette = self.gen["lamp_palette"] or (
+            (255, 174, 96), (110, 206, 214), (255, 210, 150), (150, 190, 255))
+        lamp_chance = float(prof.get("lamp_chance", 0.34))
+        lamp_max = self.gen["lamp_max"]
+        radius_mul = float(prof.get("lamp_radius_mul", 1.0))
         lamps = []
         rooms = list(plan["rooms"])
         if (chunk_x, chunk_y) == (0, 0):
             rooms.append({"rect": plan["starter"], "style": "room"})
         for room in rooms:
-            if rng.random() > 0.34:
+            if rng.random() > lamp_chance:
                 continue
             rect = room["rect"]
-            # ищем стену рядом с комнатой, вешаем лампу на неё
+            # Стена, к которой можно прикрепить лампу: стены стоят по
+            # периметру rect (а в стилях corner/ruins/courtyard — ещё и
+            # внутри), поэтому ищем соседей-стен у КАЖДОЙ клетки пола
+            # комнаты. Раньше стены искались снаружи rect — и лампы
+            # в комнатах не появлялись вовсе.
             border = []
-            for x in range(rect.left, rect.right):
-                for y in (rect.top - 1, rect.bottom):
-                    if 0 <= x < CHUNK_TILES and 0 <= y < CHUNK_TILES and grid[y][x] == self.WALL:
-                        border.append((x, y))
-            for y in range(rect.top, rect.bottom):
-                for x in (rect.left - 1, rect.right):
-                    if 0 <= x < CHUNK_TILES and 0 <= y < CHUNK_TILES and grid[y][x] == self.WALL:
-                        border.append((x, y))
+            for y in range(max(0, rect.top), min(CHUNK_TILES, rect.bottom)):
+                for x in range(max(0, rect.left), min(CHUNK_TILES, rect.right)):
+                    if grid[y][x] != self.FLOOR:
+                        continue
+                    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                        nx, ny = x + dx, y + dy
+                        if (0 <= nx < CHUNK_TILES and 0 <= ny < CHUNK_TILES
+                                and grid[ny][nx] == self.WALL):
+                            border.append((nx, ny))
             if not border:
                 continue
             tx, ty = rng.choice(border)
@@ -287,20 +329,78 @@ class World:
             x = (tx + 0.5) * TILE + ix / length * TILE * 0.9
             y = (ty + 0.5) * TILE + iy / length * TILE * 0.9
             lamps.append({
-                "x": x, "y": y, "radius": rng.choice((225, 245, 265)),
+                "x": x, "y": y,
+                "radius": int(rng.choice((225, 245, 265)) * radius_mul),
                 "color": rng.choice(palette),
                 "phase": rng.uniform(0, math.tau),
                 "kind": rng.choice(("lamp", "lamp", "crystal")),
+                "flicker": zones.pick_flicker(prof, rng.randrange(10 ** 6)),
             })
-            if len(lamps) >= 6:
+            if len(lamps) >= lamp_max:
                 break
-        # стартовая площадка всегда освещена — новичок не рождается в аду
+        # Редкий фонарный столб: просто существует и освещает небольшой
+        # кусочек пола. Ставится на свободный тайл в случайной комнате.
+        post_chance = float(prof.get("post_chance", 0.0))
+        if post_chance > 0.0 and rooms and rng.random() < post_chance:
+            rect = rng.choice(rooms)["rect"]
+            floors = [
+                (x, y)
+                for y in range(max(0, rect.top), min(CHUNK_TILES, rect.bottom))
+                for x in range(max(0, rect.left), min(CHUNK_TILES, rect.right))
+                if grid[y][x] == self.FLOOR
+            ]
+            if floors:
+                fx, fy = rng.choice(floors)
+                lamps.append({
+                    "x": (fx + 0.5) * TILE, "y": (fy + 0.5) * TILE,
+                    "radius": int(230 * radius_mul),
+                    "color": (255, 236, 190),
+                    "phase": rng.uniform(0, math.tau),
+                    "kind": "post",
+                    "flicker": "street",
+                })
+        # стартовая площадка всегда освещена — новичок не рождается в ад
         if (chunk_x, chunk_y) == (0, 0):
             cx, cy = self.player_start()
             for dx in (-260, 260):
                 lamps.append({"x": cx + dx, "y": cy + 40, "radius": 220,
                               "color": (255, 196, 120), "phase": rng.uniform(0, 6.28),
-                              "kind": "lamp"})
+                              "kind": "lamp", "flicker": "steady"})
+        # Минимум света на чанк (уютный сектор — «тёмный, но с
+        # источниками»): комнат в чанке меньше одной, поэтому лампы
+        # добираются на свободные тайлы пола с разбросом в 240 px.
+        lamp_min = min(lamp_max, self.gen["lamp_min"])
+        if len(lamps) < lamp_min:
+            floors = [(x, y)
+                      for y in range(1, CHUNK_TILES - 1)
+                      for x in range(1, CHUNK_TILES - 1)
+                      if grid[y][x] == self.FLOOR]
+            rng.shuffle(floors)
+            for tx, ty in floors:
+                if len(lamps) >= lamp_min:
+                    break
+                wx, wy = (tx + 0.5) * TILE, (ty + 0.5) * TILE
+                if any((lamp["x"] - wx) ** 2 + (lamp["y"] - wy) ** 2
+                       < 240.0 ** 2 for lamp in lamps):
+                    continue
+                lamps.append({
+                    "x": wx, "y": wy,
+                    "radius": int(rng.choice((225, 245, 265)) * radius_mul),
+                    "color": rng.choice(palette),
+                    "phase": rng.uniform(0, math.tau),
+                    "kind": rng.choice(("lamp", "lamp", "crystal")),
+                    "flicker": zones.pick_flicker(prof, rng.randrange(10 ** 6)),
+                })
+        # Координаты ламп — МИРОВЫЕ. Раньше они оставались локальными
+        # (тайлы внутри чанка): свет всех чанков собирался в одном
+        # квадрате у старта — там десятки наложенных источников (просадка
+        # FPS при «скоплении»), а вдали от старта ламп не было вовсе.
+        ox = chunk_x * self.chunk_pixels
+        oy = chunk_y * self.chunk_pixels
+        if ox or oy:
+            for lamp in lamps:
+                lamp["x"] += ox
+                lamp["y"] += oy
         return lamps
 
     def lamps_near(self, x, y, radius):
@@ -313,16 +413,36 @@ class World:
         return found
 
     def draw_lamps(self, screen, camera, time):
-        """Светящиеся плафоны рисуются ПОВЕРХ темноты (вызывается из Game)."""
+        """
+        Светящиеся плафоны рисуются ПОВЕРХ темноты (вызывается из Game).
+
+        Профиль мерцания (lamp["flicker"]) общий с световой шторой —
+        см. zones.flicker, поэтому плафон и его свет моргают одинаково
+        и детерминированно (в онлайне у всех игроков совпадает).
+        """
         for chunk in self._chunks.values():
             for lamp in chunk.get("lamps", ()):
                 if not camera.is_visible(lamp["x"], lamp["y"], 40):
                     continue
                 sx, sy = camera.to_screen(lamp["x"], lamp["y"])
-                pulse = 0.82 + 0.18 * math.sin(time * 2.2 + lamp["phase"])
+                pulse = zones.flicker(lamp.get("flicker", "steady"),
+                                      time, lamp["phase"])
                 color = tuple(int(c * pulse) for c in lamp["color"])
+                kind = lamp.get("kind", "lamp")
+                if kind == "post":
+                    # Фонарный столб: опора + светящаяся голова.
+                    pygame.draw.line(screen, (34, 37, 45),
+                                     (sx, sy + 16), (sx, sy - 10), 3)
+                    visuals.glow(screen, sx, sy - 12, 54, color, 110)
+                    pygame.draw.circle(screen, (44, 48, 58),
+                                       (int(sx), int(sy - 12)), 6)
+                    pygame.draw.circle(screen, color,
+                                       (int(sx), int(sy - 12)), 4)
+                    pygame.draw.circle(screen, (255, 252, 230),
+                                       (int(sx), int(sy - 12)), 2)
+                    continue
                 visuals.glow(screen, sx, sy, 44, color, 88)
-                if lamp["kind"] == "crystal":
+                if kind == "crystal":
                     pts = [(sx, sy - 9), (sx + 7, sy), (sx, sy + 9), (sx - 7, sy)]
                     pygame.draw.polygon(screen, color, pts)
                     pygame.draw.polygon(screen, (255, 255, 240), pts, 1)
@@ -515,7 +635,8 @@ class World:
         local_density = sum(self._density_at(key[0] * size + x, key[1] * size + y)
                             for y in (size // 4, size // 2, size * 3 // 4)
                             for x in (size // 4, size // 2, size * 3 // 4)) / 9
-        target = max(1, int(size * size / 45 * (0.35 + 1.2 * local_density)))
+        target = max(1, int(size * size / 45 * (0.35 + 1.2 * local_density)
+                            * self.gen["obstacles"]))
         placed = 0
         for _ in range(target * 16):
             if placed >= target or count >= budget:
@@ -635,6 +756,18 @@ class World:
         surface = pygame.Surface((size, size))
         rng = self._rng(chunk_x, chunk_y, "floor-detail-v2")
         surface.fill(FLOOR_COLOR)
+        # Оттенок биома: холодный у тёмного, тёплый у уютного, без
+        # изменений у среднего (регрессионный якорь).
+        tint_color, tint_strength = self.gen["floor_tint"]
+        tint_strength = max(0.0, min(1.0, float(tint_strength)))
+        props_chance = 0.11 * self.gen["props"]
+        # Заменяемая текстура пола: assets/sprites/world/floor.png.
+        # Если файла нет — рисуем плитку цветом, как раньше.
+        floor_tex = spritebank.get_scaled("world/floor", (TILE, TILE))
+        tint_layer = None
+        if floor_tex is not None and tint_strength > 0.0:
+            tint_layer = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+            tint_layer.fill((*tint_color, int(80 * tint_strength)))
 
         # --- пол: плитка, оттенок, швы, трещины, редкие пластины ---
         for ty in range(CHUNK_TILES):
@@ -644,8 +777,15 @@ class World:
                 x, y = tx * TILE, ty * TILE
                 shade = rng.randint(-8, 9)
                 base = mix(FLOOR_COLOR, (82, 94, 118), rng.random() * 0.22)
+                if tint_strength > 0.0:
+                    base = mix(base, tint_color, tint_strength)
                 color = tuple(max(0, min(255, c + shade)) for c in base)
-                pygame.draw.rect(surface, color, (x, y, TILE, TILE))
+                if floor_tex is not None:
+                    surface.blit(floor_tex, (x, y))
+                    if tint_layer is not None:
+                        surface.blit(tint_layer, (x, y))
+                else:
+                    pygame.draw.rect(surface, color, (x, y, TILE, TILE))
                 pygame.draw.line(surface, (35, 40, 54), (x, y + TILE - 1),
                                  (x + TILE - 1, y + TILE - 1))
                 pygame.draw.line(surface, (35, 40, 54), (x + TILE - 1, y),
@@ -678,7 +818,7 @@ class World:
             for tx in range(1, CHUNK_TILES - 1):
                 if grid[ty][tx] != self.FLOOR:
                     continue
-                if prop_rng.random() > 0.11:
+                if prop_rng.random() > props_chance:
                     continue
                 x, y = tx * TILE, ty * TILE
                 near_wall = any(grid[ty + dy][tx + dx] == self.WALL
@@ -722,6 +862,10 @@ class World:
                         sx = x + 5 + i * 8
                         pygame.draw.line(surface, (124, 104, 58),
                                          (sx, y + 28), (sx + 5, y + 10), 3)
+        # --- декор биома: кристаллы (тёмный) или тёплые огоньки (уютный) ---
+        if self.gen["decor"] != "classic":
+            self._render_biome_decor(surface, grid, chunk_x, chunk_y)
+
         # --- тень от стен на полу (до отрисовки самих стен) ---
         for ty in range(CHUNK_TILES - 1):
             for tx in range(CHUNK_TILES):
@@ -763,15 +907,65 @@ class World:
                                      (px - 1, y + 13), 1)
         return surface
 
+    def _render_biome_decor(self, surface, grid, chunk_x, chunk_y):
+        """
+        Приметы биома на полу (рисуются один раз на чанк):
+          * crystal — друзы синеватых кристаллов: визуальный якорь тёмных
+            секторов, где свет — редкость;
+          * warm — тёплые пятна с крошечными угольками: уютный биом,
+            где освещение есть почти всегда.
+        Декор чисто визуальный — свет и видимость он не меняет.
+        """
+        theme = self.gen["decor"]
+        rng = self._rng(chunk_x, chunk_y, "decor:" + theme)
+        for ty in range(1, CHUNK_TILES - 1):
+            for tx in range(1, CHUNK_TILES - 1):
+                if grid[ty][tx] != self.FLOOR:
+                    continue
+                x, y = tx * TILE, ty * TILE
+                if theme == "crystal":
+                    if rng.random() > 0.035:
+                        continue
+                    cx = x + rng.randint(8, TILE - 8)
+                    cy = y + rng.randint(8, TILE - 8)
+                    pygame.draw.circle(surface, (40, 70, 88), (cx, cy + 1), 3)
+                    for _ in range(rng.randint(2, 4)):
+                        h = rng.randint(4, 9)
+                        w = rng.randint(2, 4)
+                        ox = rng.randint(-6, 6)
+                        oy = rng.randint(-4, 4)
+                        pygame.draw.polygon(
+                            surface, (66, 122, 148),
+                            ((cx + ox, cy + oy - h),
+                             (cx + ox - w, cy + oy),
+                             (cx + ox + w, cy + oy)))
+                        pygame.draw.line(
+                            surface, (128, 200, 224),
+                            (cx + ox, cy + oy - h), (cx + ox, cy + oy), 1)
+                else:
+                    if rng.random() > 0.06:
+                        continue
+                    cx = x + rng.randint(10, TILE - 10)
+                    cy = y + rng.randint(10, TILE - 10)
+                    pygame.draw.ellipse(surface, (72, 58, 44),
+                                        (cx - 7, cy - 4, 14, 8))
+                    pygame.draw.circle(surface, (255, 196, 120), (cx, cy), 2)
+                    pygame.draw.circle(surface, (140, 104, 62), (cx, cy), 4, 1)
+
     def _render_wall_tile(self):
         """Одна плита стены: тёмное тело, светлая верхняя часть, шов."""
         cached = getattr(self, "_wall_tile", None)
         if cached is not None:
             return cached
         surf = pygame.Surface((TILE, TILE))
-        surf.fill(WALL_DARK)
-        pygame.draw.rect(surf, WALL_COLOR, (0, 0, TILE, TILE - 3))
-        pygame.draw.rect(surf, (98, 104, 126), (2, 2, TILE - 4, TILE - 9))
+        # Заменяемая плита стены: assets/sprites/world/wall.png.
+        texture = spritebank.get_scaled("world/wall", (TILE, TILE))
+        if texture is not None:
+            surf.blit(texture, (0, 0))
+        else:
+            surf.fill(WALL_DARK)
+            pygame.draw.rect(surf, WALL_COLOR, (0, 0, TILE, TILE - 3))
+            pygame.draw.rect(surf, (98, 104, 126), (2, 2, TILE - 4, TILE - 9))
         pygame.draw.rect(surf, WALL_EDGE, (0, 0, TILE, TILE), 1)
         pygame.draw.line(surf, (120, 132, 154), (3, 3), (3, TILE - 8), 2)
         pygame.draw.line(surf, (46, 50, 66), (2, TILE - 5), (TILE - 2, TILE - 5), 2)

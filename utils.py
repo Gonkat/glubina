@@ -103,3 +103,38 @@ def make_radial_glow(radius, color):
         alpha = int(255 * (1 - t) ** 1.6)
         pygame.draw.circle(surf, (*color, alpha), (build, build), r)
     return pygame.transform.smoothscale(surf, (radius * 2, radius * 2))
+
+
+def fade_draw(surface, x, y, alpha, draw_fn, margin=96):
+    """
+    Рисует объект с плавной прозрачностью alpha (0..1).
+
+    Приём: снимок фона под объектом → отрисовка → смесь снимка
+    обратно с альфой (1 − alpha), в результате:
+        результат = объект × alpha + фон × (1 − alpha).
+    Работает с ЛЮБЫМ кодом рисования (тело, оверлеи, надписи), не
+    требуя SRCALPHA у полотна и не трогая закэшированные спрайты.
+
+    alpha >= 1 — быстрый путь без снимка; alpha <= 0 — ничего не
+    рисуем. x, y — координаты ЦЕНТРА объекта на этом полотне.
+    margin — половина зоны снимка: должна покрывать всё, что может
+    нарисовать draw_fn (тело + HP-бар + телеграфы).
+    """
+    if alpha >= 0.995:
+        draw_fn()
+        return
+    if alpha <= 0.0:
+        return
+    w, h = surface.get_size()
+    ix, iy = int(x), int(y)
+    x0 = max(0, ix - margin)
+    y0 = max(0, iy - margin)
+    x1 = min(w, ix + margin)
+    y1 = min(h, iy + margin)
+    if x1 <= x0 or y1 <= y0:
+        return
+    clip = pygame.Rect(x0, y0, x1 - x0, y1 - y0)
+    snapshot = surface.subsurface(clip).copy()
+    draw_fn()
+    snapshot.set_alpha(int(round((1.0 - alpha) * 255)))
+    surface.blit(snapshot, clip.topleft)

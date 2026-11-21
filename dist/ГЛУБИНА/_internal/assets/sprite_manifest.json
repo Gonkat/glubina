@@ -1,0 +1,110 @@
+{
+  "_help": "Relative paths inside assets/sprites. PNG, JPG, WEBP and GIF supported. Animated GIF requires Pillow. Missing files use original procedural drawing where supported. Press F5 in game to reload.",
+  "sprites": {
+    "player": {
+      "file": "player.png"
+    },
+    "enemy": {
+      "file": "enemy.png"
+    },
+    "runner": {
+      "file": "runner.png"
+    },
+    "tank": {
+      "file": "tank.png"
+    },
+    "bomber": {
+      "file": "bomber.png"
+    },
+    "stalker": {
+      "file": "stalker.png"
+    },
+    "brute": {
+      "file": "brute.png"
+    },
+    "coin": {
+      "file": "coin.png"
+    },
+    "ammo": {
+      "file": "ammo.png"
+    },
+    "grenade": {
+      "file": "grenade.png"
+    },
+    "medkit": {
+      "file": "medkit.png"
+    },
+    "artifact": {
+      "file": "artifact.png"
+    },
+    "chest/common": {
+      "file": "chest/common.png"
+    },
+    "chest/rare": {
+      "file": "chest/rare.png"
+    },
+    "chest/legendary": {
+      "file": "chest/legendary.png"
+    },
+    "chest/opened": {
+      "file": "chest/opened.png"
+    },
+    "world/floor": {
+      "file": "world/floor.png"
+    },
+    "world/wall": {
+      "file": "world/wall.png"
+    },
+    "projectile/bullet": {
+      "file": "projectile/bullet.png"
+    },
+    "projectile/grenade": {
+      "file": "projectile/grenade.png"
+    },
+    "projectile/explosion": {
+      "file": "projectile/explosion.png"
+    },
+    "effects/muzzle_flash": {
+      "file": "effects/muzzle_flash.png"
+    },
+    "effects/hammer_wave": {
+      "file": "effects/hammer_wave.png"
+    },
+    "weapons/pistol": {
+      "file": "weapons/pistol.png"
+    },
+    "weapons/shotgun": {
+      "file": "weapons/shotgun.png"
+    },
+    "weapons/sniper": {
+      "file": "weapons/sniper.png"
+    },
+    "weapons/cannon": {
+      "file": "weapons/cannon.png"
+    },
+    "weapons/knife": {
+      "file": "weapons/knife.png"
+    },
+    "weapons/machete": {
+      "file": "weapons/machete.png"
+    },
+    "weapons/katana": {
+      "file": "weapons/katana.png"
+    },
+    "weapons/hammer": {
+      "file": "weapons/hammer.png"
+    },
+    "weapons/shovel": {
+      "file": "weapons/shovel.png"
+    },
+    "weapons/shield": {
+      "file": "weapons/shield.png"
+    },
+    "weapons/bow": {
+      "file": "weapons/bow.png"
+    },
+    "weapons/laser": {
+      "file": "weapons/laser.png"
+    }
+  }
+}

@@ -443,14 +443,32 @@ class HUD:
             if hasattr(target, "index"):
                 message = f"ЗАПУСТИТЬ МАЯК {target.index + 1}"
                 color = target.color
-            elif target.open:
-                message = f"СПУСТИТЬСЯ В СЕКТОР {target.target_depth:02d}"
-                color = (104, 238, 208)
+            elif getattr(target, "target_depth", None) is not None:
+                if target.open:
+                    message = (f"СПУСТИТЬСЯ В СЕКТОР "
+                               f"{target.target_depth:02d}")
+                    color = (104, 238, 208)
+                else:
+                    message = (f"ЛИФТ ЗАКРЫТ · МАЯКИ "
+                               f"{game.descent.active_count}/"
+                               f"{len(game.descent.beacons)}")
+                    color = (150, 164, 184)
+                    key = None
             else:
-                message = (f"ЛИФТ ЗАКРЫТ · МАЯКИ "
-                           f"{game.descent.active_count}/{len(game.descent.beacons)}")
-                color = (150, 164, 184)
-                key = None
+                # Алтарь возвращения: подсказка говорит, чего не хватает.
+                fallen = sum(1 for p in game.players if not p.alive)
+                shards = game.player.equipment.item_count("soul_shard")
+                if fallen and shards:
+                    message = f"ВОЗРОДИТЬ ПАВШЕГО · осколков {shards}"
+                    color = (198, 156, 255)
+                elif fallen:
+                    message = "НУЖЕН ОСКОЛОК ДУШИ · падает с босса"
+                    color = (152, 142, 180)
+                    key = None
+                else:
+                    message = "АЛТАРЬ ВОЗВРАЩЕНИЯ · павших нет"
+                    color = (140, 140, 160)
+                    key = None
         if message is None:
             chest = self._near_chest(game)
             shop = game.nearest_shop()
@@ -749,10 +767,11 @@ class HUD:
         items = (
             "НАЧАТЬ ВЫЛАЗКУ",
             f"СЛОЖНОСТЬ: {DIFFICULTIES[game.difficulty_key]['name'].upper()}",
+            "ОНЛАЙН",
             "ВЫЙТИ",
         )
         for index, item in enumerate(items):
-            y = 380 + index * 58
+            y = 366 + index * 52
             selected = index == game.title_index
             if selected:
                 rect = pygame.Rect(WIDTH // 2 - 250, y - 8, 500, 44)
@@ -766,7 +785,7 @@ class HUD:
 
         best = max(game.best_score, 0)
         if best:
-            visuals.text(screen, f"рекорд: {best}", (WIDTH // 2, 556), 17, DIM,
+            visuals.text(screen, f"рекорд: {best}", (WIDTH // 2, 568), 17, DIM,
                          align="center")
 
         # управление внизу
@@ -784,8 +803,11 @@ class HUD:
                 y = controls.y + 22 + ri * 42
                 visuals.key_badge(screen, key, x, y, CYAN, 15)
                 visuals.text(screen, label, (x + 72, y + 2), 16, (190, 202, 220))
-        visuals.text(screen, "W/S — выбор   A/D — сложность   Enter — начать",
+        visuals.text(screen, "W/S — выбор   A/D — сложность   Enter — открыть",
                      (WIDTH // 2, HEIGHT - 26), 15, DIM, align="center")
+        visuals.text(screen, "ОНЛАЙН — кооператив по адресу хоста (v1, до 4 игроков)",
+                     (WIDTH // 2, HEIGHT - 46), 14, (120, 190, 196),
+                     align="center")
 
     def _title_background(self, screen):
         if self._title_bg is None:

@@ -1,9 +1,13 @@
 """Timed damage-over-time and control statuses for enemies."""
 
 
-def apply_bleed(enemy, damage, duration=3.0):
+def apply_bleed(enemy, damage, duration=3.0, source=None):
     if not enemy.alive or damage <= 0:
         return
+    # source — кто наложил кровотечение: добивающий тик должен
+    # засчитать награду этому игроку, а не первому в списке.
+    if source is not None:
+        enemy.bleed_source = source
     enemy.bleed_remaining = max(getattr(enemy, "bleed_remaining", 0.0), duration)
     enemy.bleed_dps = max(getattr(enemy, "bleed_dps", 0.0), damage / duration)
 
@@ -58,7 +62,8 @@ def update_bleed(enemy, dt, game):
         return
     elapsed = min(dt, remaining)
     enemy.bleed_remaining = remaining - elapsed
-    game.damage_enemy(enemy, enemy.bleed_dps * elapsed, show_number=False)
+    game.damage_enemy(enemy, enemy.bleed_dps * elapsed, show_number=False,
+                      source=getattr(enemy, "bleed_source", None))
     if enemy.bleed_remaining <= 0:
         enemy.bleed_dps = 0.0
 

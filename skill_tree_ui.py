@@ -434,6 +434,21 @@ class SkillTreeUI:
         row = self._selected_row(rows)
         if row is None:
             return
+        # Клиент не покупает сам: он отправляет координату узла хосту,
+        # а хост заново проверяет цену, подготовку и ветви по СВОЕМУ
+        # состоянию героя. Это защищает от подмены цены и повторной
+        # покупки одного узла.
+        if getattr(game, "net_role", None) == "client":
+            session = getattr(game, "session", None)
+            if session is not None and session.request_skill(
+                    row["zone"], row["node"]["id"]):
+                self.message = "Покупка отправлена хосту…"
+                self.message_color = (170, 200, 226)
+            else:
+                self._fail("Нет связи с хостом")
+                return
+            self.message_timer = self.MESSAGE_TIME
+            return
         state = row["state"]
         node = row["node"]
         if state == "training" and not skill_tree.can_cover_training(

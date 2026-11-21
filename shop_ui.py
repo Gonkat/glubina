@@ -198,6 +198,19 @@ class ShopUI:
             return
         self.cursor = min(self.cursor, len(items) - 1)
         offer = items[self.cursor]
+        # Клиент не тратит деньги сам: он отправляет НАМЕРЕНИЕ хосту,
+        # а хост проверяет расстояние, баланс и выдаёт предмет. До
+        # подтверждения витрина остаётся прежней.
+        if getattr(game, "net_role", None) == "client":
+            session = getattr(game, "session", None)
+            if session is not None and session.request_buy(
+                    self.active_shop, self.cursor, offer.get("kind"),
+                    offer.get("key")):
+                self.message = "Покупка отправлена хосту…"
+            else:
+                self.message = "Нет связи с хостом"
+            self.message_timer = 2.4
+            return
         handler = BUY_HANDLERS.get(offer["kind"])
         if handler is None:
             raise ValueError(f"Нет обработчика для {offer['kind']!r}")
@@ -246,6 +259,11 @@ class ShopUI:
                 ])
                 return
         if kind == "artifact":
+            sprite = spritebank.get_scaled(f"artifacts/{offer['key']}",
+                                           (size, size))
+            if sprite is not None:
+                screen.blit(sprite, sprite.get_rect(center=center))
+                return
             color = RARITY_COLORS.get(ARTIFACTS[offer["key"]]["rarity"],
                                       (196, 144, 255))
             pts = [(cx, cy - size // 2), (cx + size // 2, cy),

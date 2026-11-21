@@ -1,5 +1,5 @@
 {
-  "_help": "Relative paths inside assets/sprites. PNG, JPG, WEBP and GIF supported. Animated GIF requires Pillow. Missing files use original procedural drawing where supported. Press F5 in game to reload.",
+  "_help": "Relative paths inside assets/sprites. PNG, JPG, WEBP and GIF supported. Animated GIF requires Pillow. Delete or rename a file and the game falls back to its procedural drawing. Press F5 in game to reload.",
   "sprites": {
     "player": {
       "file": "player.png"
@@ -19,8 +19,26 @@
     "stalker": {
       "file": "stalker.png"
     },
+    "spitter": {
+      "file": "spitter.png"
+    },
     "brute": {
       "file": "brute.png"
+    },
+    "boss/warden": {
+      "file": "boss/warden.png"
+    },
+    "boss/reaper": {
+      "file": "boss/reaper.png"
+    },
+    "boss/overlord": {
+      "file": "boss/overlord.png"
+    },
+    "boss/worm": {
+      "file": "boss/worm.png"
+    },
+    "boss/worm_segment": {
+      "file": "boss/worm_segment.png"
     },
     "coin": {
       "file": "coin.png"
@@ -37,6 +55,12 @@
     "artifact": {
       "file": "artifact.png"
     },
+    "world/floor": {
+      "file": "world/floor.png"
+    },
+    "world/wall": {
+      "file": "world/wall.png"
+    },
     "chest/common": {
       "file": "chest/common.png"
     },
@@ -49,11 +73,17 @@
     "chest/opened": {
       "file": "chest/opened.png"
     },
-    "world/floor": {
-      "file": "world/floor.png"
+    "boss/material/bone": {
+      "file": "boss/material/bone.png"
     },
-    "world/wall": {
-      "file": "world/wall.png"
+    "boss/material/hide": {
+      "file": "boss/material/hide.png"
+    },
+    "boss/material/core": {
+      "file": "boss/material/core.png"
+    },
+    "boss/material/shadow": {
+      "file": "boss/material/shadow.png"
     },
     "projectile/bullet": {
       "file": "projectile/bullet.png"
@@ -70,6 +100,15 @@
     "effects/hammer_wave": {
       "file": "effects/hammer_wave.png"
     },
+    "object/altar": {
+      "file": "object/altar.png"
+    },
+    "object/lift": {
+      "file": "object/lift.png"
+    },
+    "object/beacon": {
+      "file": "object/beacon.png"
+    },
     "weapons/pistol": {
       "file": "weapons/pistol.png"
     },
@@ -81,6 +120,15 @@
     },
     "weapons/cannon": {
       "file": "weapons/cannon.png"
+    },
+    "weapons/disc": {
+      "file": "weapons/disc.png"
+    },
+    "weapons/arc": {
+      "file": "weapons/arc.png"
+    },
+    "weapons/cutter": {
+      "file": "weapons/cutter.png"
     },
     "weapons/knife": {
       "file": "weapons/knife.png"
@@ -100,11 +148,35 @@
     "weapons/shield": {
       "file": "weapons/shield.png"
     },
-    "weapons/bow": {
-      "file": "weapons/bow.png"
+    "artifacts/boots": {
+      "file": "artifacts/boots.png"
     },
-    "weapons/laser": {
-      "file": "weapons/laser.png"
+    "artifacts/armor": {
+      "file": "artifacts/armor.png"
+    },
+    "artifacts/amulet": {
+      "file": "artifacts/amulet.png"
+    },
+    "artifacts/fang": {
+      "file": "artifacts/fang.png"
+    },
+    "artifacts/dash": {
+      "file": "artifacts/dash.png"
+    },
+    "artifacts/nova": {
+      "file": "artifacts/nova.png"
+    },
+    "artifacts/shield": {
+      "file": "artifacts/shield.png"
+    },
+    "artifacts/devourer": {
+      "file": "artifacts/devourer.png"
+    },
+    "artifacts/heart": {
+      "file": "artifacts/heart.png"
+    },
+    "artifacts/thunder": {
+      "file": "artifacts/thunder.png"
     }
   }
 }

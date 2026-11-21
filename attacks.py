@@ -11,6 +11,7 @@ import math
 import pygame
 
 import soundbank
+import spritebank
 from status_effects import apply_bleed, apply_dust, apply_slow, apply_stun
 from utils import angle_diff
 
@@ -538,6 +539,13 @@ class ShockwaveAttack(MeleeAttack):
             radius = max(1, int(wave["radius"] * progress))
             alpha = max(25, int(180 * (1.0 - progress)))
             color = self.spec["color"]
+            ring = spritebank.get_scaled("effects/hammer_wave",
+                                         (radius * 2, radius * 2))
+            if ring is not None:
+                frame = ring.copy()
+                frame.set_alpha(alpha)
+                overlay.blit(frame, frame.get_rect(center=(int(cx), int(cy))))
+                continue
             pygame.draw.circle(overlay, (*color, alpha // 4), (int(cx), int(cy)), radius)
             pygame.draw.circle(overlay, (*color, alpha), (int(cx), int(cy)), radius, 7)
             pygame.draw.circle(overlay, (*color, min(255, alpha + 55)),

@@ -1,6 +1,6 @@
 """TCP-транспорт: слушатель хоста, клиент и одно соединение.
 
-Почему TCP, а не UDP: у нас 20 снимков в секунду и несколько десятков
+Почему TCP, а не UDP: у нас 60 снимков в секунду и несколько десятков
 килобайт состояния. Потери UDP пришлось бы компенсировать вручную
 (подтверждения, дельта-сжатие, порядок), а выигрыш по задержке на
 таком объёме незначителен. TCP даёт доставку и порядок бесплатно;
@@ -19,6 +19,7 @@
 import queue
 import socket
 import threading
+import time
 
 from . import protocol
 
@@ -59,6 +60,17 @@ class Connection:
                         return
                     if message is None:
                         break
+                    # Пинг — единственное сообщение без состояния мира:
+                    # отвечаем прямо здесь, не дожидаясь кадра игры. Иначе
+                    # RTT в F3 мерил бы частоту кадров хоста (+16 мс), а не
+                    # сеть, и врал бы на всю LAN.
+                    if message.get("t") == "ping":
+                        self.send(protocol.pong(message.get("stamp", 0)))
+                        continue
+                    if message.get("t") == "pong":
+                        # Момент прихода — здесь, а не в кадре игры: иначе
+                        # RTT вбирал бы в себя ожидание кадра клиента.
+                        message["_rx"] = time.monotonic()
                     self._inbox.put(("message", message))
         except OSError:
             pass
@@ -85,6 +97,16 @@ class Connection:
         try:
             self._outbox.put_nowait(protocol.encode(message))
         except (protocol.ProtocolError, queue.Full):
+            return False
+        return True
+
+    def send_bytes(self, frame):
+        """Готовый кадр (бинарный протокол) — без повторного кодирования."""
+        if self._closed.is_set() or not frame:
+            return False
+        try:
+            self._outbox.put_nowait(frame)
+        except queue.Full:
             return False
         return True
 

@@ -577,17 +577,21 @@ class HUD:
             renderer_label = "› " if selected == 1 else ""
             adapter_label = "› " if selected == 2 else ""
             effects_label = "› " if selected == 3 else ""
+            fps_label = "› " if selected == 4 else ""
+            vsync_label = "› " if selected == 5 else ""
             volume_color = GOLD if selected == 0 else TEXT
             renderer_color = GOLD if selected == 1 else TEXT
             adapter_color = GOLD if selected == 2 else TEXT
             effects_color = GOLD if selected == 3 else TEXT
+            fps_color = GOLD if selected == 4 else TEXT
+            vsync_color = GOLD if selected == 5 else TEXT
 
             visuals.text(screen, f"{volume_label}ГРОМКОСТЬ ЗВУКА",
-                         (panel.centerx, 182), 21, volume_color, align="center")
-            bar = pygame.Rect(panel.centerx - 170, 214, 340, 14)
+                         (panel.centerx, 176), 21, volume_color, align="center")
+            bar = pygame.Rect(panel.centerx - 170, 201, 340, 14)
             visuals.bar(screen, bar, volume / 100, GOLD, (24, 29, 40),
                         border=(8, 12, 18), segments=10)
-            visuals.text(screen, f"{volume}%", (panel.centerx, 238), 18, GOLD,
+            visuals.text(screen, f"{volume}%", (panel.centerx, 222), 18, GOLD,
                          align="center")
 
             mode = getattr(video, "mode", "cpu")
@@ -601,10 +605,10 @@ class HUD:
             else:
                 detail = "Совместимый режим без OpenGL."
             visuals.text(screen, f"{renderer_label}РЕНДЕР",
-                         (panel.centerx, 276), 21, renderer_color, align="center")
-            visuals.text(screen, renderer, (panel.centerx, 304), 19, GOLD,
+                         (panel.centerx, 254), 21, renderer_color, align="center")
+            visuals.text(screen, renderer, (panel.centerx, 280), 19, GOLD,
                          align="center")
-            visuals.text(screen, detail, (panel.centerx, 328), 15, DIM,
+            visuals.text(screen, detail, (panel.centerx, 302), 15, DIM,
                          align="center")
 
             if video is not None:
@@ -618,25 +622,37 @@ class HUD:
                 adapter_name = "—"
                 adapter_detail = ""
             visuals.text(screen, f"{adapter_label}ВИДЕОАДАПТЕР",
-                         (panel.centerx, 364), 21, adapter_color, align="center")
-            visuals.text(screen, adapter_name[:52], (panel.centerx, 392), 18,
+                         (panel.centerx, 334), 21, adapter_color, align="center")
+            visuals.text(screen, adapter_name[:52], (panel.centerx, 360), 18,
                          GOLD, align="center")
-            visuals.text(screen, adapter_detail, (panel.centerx, 416), 15, DIM,
+            visuals.text(screen, adapter_detail, (panel.centerx, 382), 15, DIM,
                          align="center")
 
             effects_on = bool(getattr(video, "effects", False))
             visuals.text(screen, f"{effects_label}GPU-ЭФФЕКТЫ",
-                         (panel.centerx, 452), 21, effects_color, align="center")
+                         (panel.centerx, 414), 21, effects_color, align="center")
             visuals.text(screen, "ВКЛ · мягкое свечение" if effects_on else "ВЫКЛ",
-                         (panel.centerx, 480), 18, GOLD, align="center")
+                         (panel.centerx, 440), 18, GOLD, align="center")
             visuals.text(screen, "Финальный кадр и масштаб — на видеокарте; логика на CPU.",
-                         (panel.centerx, 504), 14, DIM, align="center")
+                         (panel.centerx, 460), 14, DIM, align="center")
+
+            cap = int(getattr(video, "fps_cap", 0) or 0)
+            cap_text = f"{cap} FPS" if cap else "БЕЗ ОГРАНИЧЕНИЯ"
+            vsync_on = bool(getattr(video, "vsync", False))
+            visuals.text(screen, f"{fps_label}ЛИМИТ КАДРОВ",
+                         (panel.centerx, 492), 21, fps_color, align="center")
+            visuals.text(screen, cap_text, (panel.centerx, 518), 18, GOLD,
+                         align="center")
+            visuals.text(screen, f"{vsync_label}ВЕРТ. СИНХРОНИЗАЦИЯ",
+                         (panel.centerx, 552), 21, vsync_color, align="center")
+            visuals.text(screen, "ВКЛ" if vsync_on else "ВЫКЛ (vsync=0)",
+                         (panel.centerx, 578), 18, GOLD, align="center")
 
             if game.settings_notice:
                 notice_lines = textwrap.wrap(game.settings_notice, width=68)[:2]
                 for line_index, line in enumerate(notice_lines):
                     visuals.text(screen, line,
-                                 (panel.centerx, 532 + line_index * 20),
+                                 (panel.centerx, 604 + line_index * 20),
                                  15, GOLD, align="center")
             hint = "W/S — выбор   A/D — изменить   Enter — GPU-перезапуск   Esc — назад"
         else:

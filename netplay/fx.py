@@ -70,6 +70,10 @@ class ClientFx:
             y = float(state.get("y", 0.0))
             if previous is not None and hp < previous - 0.5:
                 game.damage_flash = min(1.0, game.damage_flash + 0.8)
+                threat = self._threat_angle(x, y)
+                if threat is not None:
+                    game.hit_dir = threat
+                    game.hit_dir_timer = 0.9
                 game.camera.add_shake(3.6, 0.0)
                 soundbank.play("hurt", 0.8)
             if previous_money is not None and money > previous_money:
@@ -82,6 +86,29 @@ class ClientFx:
                 soundbank.play("enemy_die", 0.5)
                 for _ in range(12):
                     game.effects.append(Particle(x, y, (196, 82, 82)))
+
+    def _threat_angle(self, local_x, local_y):
+        """Откуда прилетел урон: ближайший враг или снаряд.
+
+        Клиент не знает, кто именно попал (урон решает хост), но ближайшая
+        угроза в момент потери HP — честная подсказка: игрок видит сектор
+        со стороны удара, а не «урон из ниоткуда».
+        """
+        best_d2 = 900.0 * 900.0
+        best = None
+        for enemy in self._enemy_pos.values():
+            d2 = (enemy[0] - local_x) ** 2 + (enemy[1] - local_y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = (enemy[0], enemy[1])
+        for bullet in self._bullet_pos.values():
+            d2 = (bullet[0] - local_x) ** 2 + (bullet[1] - local_y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = (bullet[0], bullet[1])
+        if best is None:
+            return None
+        return math.atan2(best[1] - local_y, best[0] - local_x)
 
     def _track_enemies(self, states, local):
         game = self.game
@@ -171,6 +198,142 @@ class ClientFx:
                         (255, 226, 160), 140))
 
     # ------------------------------------------------------------ КАДР
+    # ------------------------------------------------- БИНАРНЫЙ СНИМОК
+    def apply_rows(self, player_rows, enemy_rows, bullet_rows, local_pid,
+                   kind_of=None):
+        """То же, что ``apply``, но строки — кортежи, без словарей.
+
+        Снимок не несёт описаний (kind), их знает клиентское зеркало: оно
+        и передаёт ответы через ``kind_of``.
+        """
+        self._clock += 0.05
+        game = self.game
+        local_x = local_y = None
+        for row in player_rows:
+            if row[0] == local_pid:
+                local_x, local_y = row[1], row[2]
+                break
+        self._rows_players(player_rows, local_pid, local_x, local_y)
+        self._rows_enemies(enemy_rows, local_x, local_y, kind_of)
+        self._rows_bullets(bullet_rows, local_x, local_y)
+        self._cap()
+
+    def _rows_players(self, rows, local_pid, local_x, local_y):
+        game = self.game
+        for row in rows:
+            pid, hp, money = row[0], row[4], row[7]
+            previous = self._player_hp.get(pid)
+            previous_money = self._money.get(pid)
+            self._player_hp[pid] = hp
+            self._money[pid] = money
+            if pid != local_pid:
+                continue
+            if previous is not None and hp < previous - 0.5:
+                game.damage_flash = min(1.0, game.damage_flash + 0.8)
+                threat = self._threat_angle(local_x, local_y)
+                if threat is not None:
+                    game.hit_dir = threat
+                    game.hit_dir_timer = 0.9
+                game.camera.add_shake(3.6, 0.0)
+                soundbank.play("hurt", 0.8)
+            if previous_money is not None and money > previous_money:
+                gain = money - previous_money
+                if gain >= 1:
+                    game.effects.append(FloatingText(
+                        local_x + random.uniform(-5, 5), local_y - 28,
+                        f"+{gain}", (255, 208, 100), 17, 52.0))
+            if previous is not None and hp <= 0.0 < previous:
+                soundbank.play("enemy_die", 0.5)
+                for _ in range(12):
+                    game.effects.append(Particle(local_x, local_y,
+                                                 (196, 82, 82)))
+
+    def _rows_enemies(self, rows, local_x, local_y, kind_of):
+        game = self.game
+        seen = set()
+        for row in rows:
+            eid, x, y, hp = row[0], row[1], row[2], row[4]
+            seen.add(eid)
+            radius = self._enemy_pos.get(eid, (0.0, 0.0, 18.0))[2]
+            previous = self._enemy_hp.get(eid)
+            self._enemy_hp[eid] = hp
+            self._enemy_pos[eid] = (x, y, radius)
+            if kind_of is not None:
+                self._enemy_kind[eid] = kind_of(eid)
+            if local_x is None:
+                continue
+            if math.hypot(x - local_x, y - local_y) > SPARK_DISTANCE:
+                continue
+            if previous is not None and hp < previous - 0.5:
+                dealt = previous - hp
+                now = self._clock
+                if now - self._numbers.get(eid, -1.0) >= NUMBER_COOLDOWN:
+                    self._numbers[eid] = now
+                    if dealt >= 90:
+                        color, size = (255, 226, 130), 28
+                    elif dealt >= 35:
+                        color, size = (255, 246, 210), 23
+                    else:
+                        color, size = (255, 238, 200), 18
+                    game.effects.append(FloatingText(
+                        x + random.uniform(-6, 6), y - radius * 0.7,
+                        int(round(dealt)), color, size))
+                for _ in range(2):
+                    game.effects.append(Spark(
+                        x, y, random.uniform(0, math.tau),
+                        (255, 220, 150), 150))
+        for eid in list(self._enemy_hp):
+            if eid in seen:
+                continue
+            x, y, radius = self._enemy_pos.pop(eid, (0.0, 0.0, 18.0))
+            kind = self._enemy_kind.pop(eid, "Enemy")
+            self._enemy_hp.pop(eid, None)
+            self._numbers.pop(eid, None)
+            if local_x is None or math.hypot(x - local_x,
+                                             y - local_y) > SPARK_DISTANCE:
+                continue
+            for _ in range(10):
+                game.effects.append(Particle(x, y, (170, 92, 92)))
+            if kind == "Bomber":
+                game.effects.append(Explosion(x, y, 115))
+                game.camera.add_shake(4.0)
+                soundbank.play("explosion", 0.55)
+            elif kind in ("StoneWarden", "ShadowReaper", "BlastOverlord"):
+                game.effects.append(Explosion(x, y, 150))
+                game.camera.add_shake(8.0)
+                soundbank.play("explosion", 0.8)
+
+    def _rows_bullets(self, rows, local_x, local_y):
+        game = self.game
+        seen = set()
+        for row in rows:
+            bid, x, y, vx, vy = row[0], row[1], row[2], row[3], row[4]
+            seen.add(bid)
+            self._bullet_pos[bid] = (x, y)
+            if bid not in self._known_bullets:
+                self._known_bullets.add(bid)
+                if local_x is not None and math.hypot(
+                        x - local_x, y - local_y) < 1000:
+                    view = getattr(game, "client_view", None)
+                    consume = getattr(view, "consume_local_flash", None)
+                    if consume is not None and consume(x, y):
+                        continue
+                    angle = math.atan2(vy, vx)
+                    game.effects.append(MuzzleFlash(x, y, angle))
+                    if random.random() < 0.5:
+                        game.effects.append(Casing(x, y, angle))
+        for bid in list(self._bullet_pos):
+            if bid in seen:
+                continue
+            x, y = self._bullet_pos.pop(bid)
+            self._known_bullets.discard(bid)
+            if local_x is not None and math.hypot(
+                    x - local_x, y - local_y) < SPARK_DISTANCE:
+                for _ in range(3):
+                    game.effects.append(Spark(
+                        x, y, random.uniform(0, math.tau),
+                        (255, 226, 160), 140))
+
     def update(self, dt):
         self._clock += dt
 

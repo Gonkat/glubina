@@ -29,7 +29,7 @@ import pygame
 
 from render import CPUDisplay, OpenGLPresenter
 from render_metrics import FrameMetrics
-from settings import HEIGHT, WIDTH
+from settings import FPS, HEIGHT, WIDTH
 
 
 # ------------------------------------------------------------------ адаптеры
@@ -183,11 +183,16 @@ def _set_windows_gpu_preference(preference: int) -> tuple[bool, str]:
 
 
 # ------------------------------------------------------------------ manager
+# Лимит кадров: 0 — без ограничения. 144 — прежнее поведение (settings.FPS).
+FPS_CAP_OPTIONS = (60, 120, 144, 240, 0)
+
 DEFAULT_CONFIG = {
     "renderer": "opengl",
     "adapter": "auto",
     "adapter_preference": 0,
     "effects": True,
+    "fps_cap": FPS,
+    "vsync": False,
 }
 
 
@@ -214,6 +219,13 @@ class VideoManager:
             self.selected_preference = int(config.get("adapter_preference", 0))
         except (TypeError, ValueError):
             self.selected_preference = 0
+        try:
+            self.fps_cap = int(config.get("fps_cap", FPS))
+        except (TypeError, ValueError):
+            self.fps_cap = FPS
+        if self.fps_cap not in FPS_CAP_OPTIONS:
+            self.fps_cap = FPS
+        self.vsync = bool(config.get("vsync", False))
 
         self.mode = "cpu"
         self.renderer = None
@@ -260,7 +272,7 @@ class VideoManager:
             try:
                 presenter = OpenGLPresenter(
                     (self.width, self.height), effects=self.effects,
-                    metrics=self.metrics,
+                    metrics=self.metrics, vsync=self.vsync,
                 )
             except Exception as exc:  # PyOpenGL/драйвер/контекст
                 self.last_error = f"OpenGL недоступен: {exc}"
@@ -277,7 +289,8 @@ class VideoManager:
 
         try:
             display = CPUDisplay(
-                (self.width, self.height), metrics=self.metrics
+                (self.width, self.height), metrics=self.metrics,
+                vsync=self.vsync,
             )
         except Exception as exc:
             self.last_error = f"Не удалось открыть окно: {exc}"
@@ -290,6 +303,38 @@ class VideoManager:
     def present(self):
         if self.renderer is not None:
             self.renderer.present()
+
+    # --------------------------------------------------------------- кадры
+    def frame_rate(self) -> int:
+        """Лимит для ``clock.tick()``; 0 — без ограничения."""
+        return int(self.fps_cap)
+
+    def cycle_fps_cap(self, step: int) -> int:
+        """Следующий/предыдущий предел кадров из списка настроек."""
+        try:
+            index = FPS_CAP_OPTIONS.index(self.fps_cap)
+        except ValueError:
+            index = FPS_CAP_OPTIONS.index(FPS)
+        self.fps_cap = FPS_CAP_OPTIONS[
+            (index + (1 if step > 0 else -1)) % len(FPS_CAP_OPTIONS)
+        ]
+        self.save()
+        return self.fps_cap
+
+    def set_vsync(self, enabled: bool) -> bool:
+        """Включает/выключает вертикальную синхронизацию, пересоздавая окно."""
+        enabled = bool(enabled)
+        if enabled == self.vsync:
+            return self.vsync
+        self.vsync = enabled
+        self.save()
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
+            pygame.display.quit()
+            pygame.display.init()
+            self._create_display(self.requested_mode)
+        return self.vsync
 
     def switch_mode(self, mode: str):
         mode = str(mode).lower()
@@ -409,6 +454,8 @@ class VideoManager:
             "adapter": self.selected_key,
             "adapter_preference": self.selected_preference,
             "effects": self.effects,
+            "fps_cap": self.fps_cap,
+            "vsync": self.vsync,
         }
         try:
             temporary = self.config_path.with_suffix(".tmp")

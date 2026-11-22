@@ -124,6 +124,15 @@ class SpriteBank:
             self._fallbacks[name] = self._fallback(name)
         return self._fallbacks[name]
 
+    def preload(self):
+        """Загружает все спрайты манифеста заранее (на старте, не в бою).
+
+        В кадре спрайт берётся только из этого кэша: ни pygame.image.load,
+        ни convert_alpha() на горячем пути.
+        """
+        for name in list(self._config):
+            self.try_get(name)
+
     def get_rotated(self, name, angle):
         deg = int(round(math.degrees(angle) / 3) * 3) % 360
         base = self.get(name)
@@ -154,6 +163,7 @@ try_get = _bank.try_get
 get_rotated = _bank.get_rotated
 get_scaled = _bank.get_scaled
 reload = _bank.reload
+preload = _bank.preload
 
 
 def missing_assets():

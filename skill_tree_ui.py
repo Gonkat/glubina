@@ -40,6 +40,7 @@ BAD = (240, 150, 110)
 LACK = (232, 120, 100)
 DIM = (130, 144, 166)
 WHITE = (232, 239, 250)
+PENDING = (214, 188, 120)   # намерение ушло хосту, ответа ещё нет
 PANEL = (8, 12, 21)
 PANEL_EDGE = (48, 62, 84)
 
@@ -423,6 +424,23 @@ class SkillTreeUI:
         soundbank.play("ui_move")
 
     # ------------------------------------------------------------ ПОКУПКА
+    @staticmethod
+    def _pending_for(game, row):
+        """Сколько намерений об этом узле ещё ждут ответа хоста."""
+        if getattr(game, "net_role", None) != "client":
+            return 0
+        session = getattr(game, "session", None)
+        counter = getattr(session, "pending_count", None)
+        if counter is None:
+            return 0
+        return counter("skill", f"{row['zone']}|{row['node']['id']}")
+
+    def notify_result(self, ok, text):
+        """Ответ хоста на покупку узла: подтверждение или причина отказа."""
+        self.message = text
+        self.message_color = GOOD if ok else BAD
+        self.message_timer = self.MESSAGE_TIME
+
     def _fail(self, message):
         self.message = message
         self.message_color = BAD
@@ -440,10 +458,20 @@ class SkillTreeUI:
         # покупки одного узла.
         if getattr(game, "net_role", None) == "client":
             session = getattr(game, "session", None)
+            # Один узел покупается один раз: повторный Enter, пока ответа
+            # нет, — это не вторая покупка, а дубль намерения. Гасим его
+            # локально, не нагружая хост.
+            if (session is not None and self._pending_for(game, row)):
+                self.message = "Уже отправлено — ждём ответа хоста"
+                self.message_color = PENDING
+                self.message_timer = self.MESSAGE_TIME
+                return
             if session is not None and session.request_skill(
                     row["zone"], row["node"]["id"]):
-                self.message = "Покупка отправлена хосту…"
-                self.message_color = (170, 200, 226)
+                # Оптимистичный отклик: узел сразу обведён «проверкой»,
+                # но покупка и списание — только по ответу хоста.
+                self.message = "Отправлено хосту · ждём подтверждения"
+                self.message_color = PENDING
             else:
                 self._fail("Нет связи с хостом")
                 return
@@ -993,9 +1021,11 @@ class SkillTreeUI:
             if not (-30 <= sx <= WIDTH + 30 and self.VIEW.top - 30 <= sy <= self.VIEW.bottom + 30):
                 continue
             self._draw_node(screen, game, row, sx, sy,
-                            selected == self._key(row), hover == self._key(row))
+                            selected == self._key(row), hover == self._key(row),
+                            pending=self._pending_for(game, row))
 
-    def _draw_node(self, screen, game, row, sx, sy, selected, hovered):
+    def _draw_node(self, screen, game, row, sx, sy, selected, hovered,
+                   pending=0):
         zone = row["zone"]
         state = row["state"]
         radius = max(5, int(skill_board.BoardLayout.node_radius(zone) * self.zoom))
@@ -1077,6 +1107,13 @@ class SkillTreeUI:
                               GOLD, max(1, int(2 * self.zoom)), 235)
         elif hovered:
             visuals.draw_ring(screen, sx, sy, int(radius + 5), WHITE, 1, 150)
+        if pending:
+            # Временное состояние клиента: узел ещё НЕ куплен, запрос в пути.
+            pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 280.0)
+            visuals.draw_ring(screen, sx, sy, int(radius + 6 + 3 * pulse),
+                              PENDING, 2, 210)
+            self._text(screen, visuals.font(15), "···", PENDING,
+                       center=(int(sx), int(sy - radius - 12)))
 
     # ------------------------------------------------------------ ИКОНКИ
     @staticmethod

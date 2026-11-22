@@ -292,7 +292,7 @@ class Player(GameObject):
         self.dash_strike_timer = DASH_STRIKE_WINDOW
         self.invuln_timer = max(self.invuln_timer,
                                 DASH_INVULN + self.skill_mod("dash_invuln_add"))
-        soundbank.play("dash", 0.55)
+        soundbank.emit(self, "dash", 0.55)
         return True
 
     # ------------------------------------------------------------ ЛОГИКА
@@ -310,28 +310,37 @@ class Player(GameObject):
         if regen > 0.0 and self.alive:
             self.heal(regen * dt)
 
+        # Гость — владелец позиции своего героя (см. netplay/session.py
+        # и netplay/binary.py): хост только принимает координаты. Скипаем
+        # интеграцию, но таймеры, оружие и анимация продолжают идти.
+        authoritative = getattr(self, "position_authoritative", False)
         if self.dash_timer > 0.0:
             # перекат: движемся сами, обычный ввод движения временно молчит
             self.dash_timer = max(0.0, self.dash_timer - dt)
-            step = DASH_SPEED * dt
-            nx = self.x + self.dash_dir[0] * step
-            ny = self.y + self.dash_dir[1] * step
-            self.x, self.y = game.world.resolve_circle(nx, ny, self.radius)
+            if not authoritative:
+                step = DASH_SPEED * dt
+                nx = self.x + self.dash_dir[0] * step
+                ny = self.y + self.dash_dir[1] * step
+                self.x, self.y = game.world.resolve_circle(nx, ny, self.radius)
+                game.spawn_dash_ghost(self)
             self.walk_phase += dt * 24.0
-            game.spawn_dash_ghost(self)
         else:
             # движение по осям, чтобы скользить вдоль стен, а не залипать.
             # «Подвижный контур» пушки добавляет скорость именно во время
             # заряда: мобильность — свойство билда, а не глобальный бафф.
-            move_scale = 1.0
-            carried = self.equipment.get("firearm")
-            if (carried is not None and getattr(carried, "is_charging", False)
-                    and getattr(carried, "uses_charge", False)):
-                move_scale += float(carried.mod("charge_move_bonus", 0.0))
-            self.x += self.move_dir[0] * self.speed * dt * move_scale
-            self.x, self.y = game.world.resolve_circle(self.x, self.y, self.radius)
-            self.y += self.move_dir[1] * self.speed * dt * move_scale
-            self.x, self.y = game.world.resolve_circle(self.x, self.y, self.radius)
+            if not authoritative:
+                move_scale = 1.0
+                carried = self.equipment.get("firearm")
+                if (carried is not None
+                        and getattr(carried, "is_charging", False)
+                        and getattr(carried, "uses_charge", False)):
+                    move_scale += float(carried.mod("charge_move_bonus", 0.0))
+                self.x += self.move_dir[0] * self.speed * dt * move_scale
+                self.x, self.y = game.world.resolve_circle(
+                    self.x, self.y, self.radius)
+                self.y += self.move_dir[1] * self.speed * dt * move_scale
+                self.x, self.y = game.world.resolve_circle(
+                    self.x, self.y, self.radius)
             if self.move_dir[0] or self.move_dir[1]:
                 self.walk_phase += dt * 10.0
 
@@ -473,13 +482,13 @@ class Player(GameObject):
                 elif result == "cancel":
                     # Слышимая, но тихая отмена: игрок понимает, что
                     # выстрела не было, и не ищет пропавший патрон.
-                    soundbank.play("empty", 0.16)
+                    soundbank.emit(self, "empty", 0.16)
             self._firearm_trigger_was_held = False
             return
 
         if not weapon.is_charging and weapon.can_fire:
             if weapon.begin_charge():
-                soundbank.play(weapon.mode_profile.get(
+                soundbank.emit(self, weapon.mode_profile.get(
                     "charge_start_sound",
                     weapon.spec.get("charge_start_sound", "spit_charge")), 0.35)
         elif (not weapon.is_charging and not weapon.can_fire
@@ -490,7 +499,7 @@ class Player(GameObject):
         if weapon.is_charging:
             event = weapon.advance_charge(dt, self)
             if event == "full":
-                soundbank.play(weapon.mode_profile.get(
+                soundbank.emit(self, weapon.mode_profile.get(
                     "charge_full_sound",
                     weapon.spec.get("charge_full_sound", "lightning")), 0.48)
         self._firearm_trigger_was_held = True
@@ -514,7 +523,7 @@ class Player(GameObject):
             fx, fy, self.angle,
             color=weapon.charge_color))
         game.on_shot(weapon, self)
-        soundbank.play(weapon.mode_profile.get(
+        soundbank.emit(self, weapon.mode_profile.get(
             "charge_sound", weapon.spec.get("charge_sound", "sniper")),
                        0.55 + 0.35 * ratio)
         if ratio >= 0.999:
@@ -546,7 +555,7 @@ class Player(GameObject):
                 return
             if weapon.has_live_disc:
                 if weapon.recall_discs():
-                    soundbank.play("lightning", 0.22)
+                    soundbank.emit(self, "lightning", 0.22)
                 self._firearm_trigger_was_held = True
                 return
         # Режимы с ценой 2-3 патрона не должны «заклинивать» на остатке 1.
@@ -593,7 +602,7 @@ class Player(GameObject):
         game.effects.append(MuzzleFlash(fx, fy, self.angle))
         game.on_shot(weapon, self)
         # звук выстрела выбирается ДАННЫМИ оружия и режима (weapon_data)
-        soundbank.play(weapon.mode_profile.get(
+        soundbank.emit(self, weapon.mode_profile.get(
             "sound", weapon.spec.get("sound", "shoot")))
         # Резак: выстрел мог закрутить тепло до предела — тогда сброс
         # происходит сразу после выстрела, а не вместо него.
@@ -613,7 +622,7 @@ class Player(GameObject):
                 disc.caught = True
                 disc.kill()
                 weapon.drop_disc(disc)
-                soundbank.play("pickup", 0.35)
+                soundbank.emit(self, "pickup", 0.35)
                 for _ in range(4):
                     game.effects.append(Spark(
                         self.x, self.y, random.uniform(0, math.tau),
@@ -638,7 +647,7 @@ class Player(GameObject):
         self.take_damage(weapon.vent_self_damage(), game)
         game.camera.add_shake(6.0)
         game.hitstop = max(getattr(game, "hitstop", 0.0), 0.12)
-        soundbank.play("lightning", 0.5)
+        soundbank.emit(self, "lightning", 0.5)
         game.toast("ПЕРЕГРЕВ — контур сброшен", 1.4, color=(255, 150, 110))
 
     def start_reload(self):
@@ -649,9 +658,9 @@ class Player(GameObject):
             # «переехать» через анимацию и выстрелить после неё.
             self.cancel_charge()
         if weapon is not None and weapon.start_reload(self.equipment):
-            soundbank.play("reload")
+            soundbank.emit(self, "reload")
         elif self.empty_click_cd <= 0.0:
-            soundbank.play("empty", 0.5)
+            soundbank.emit(self, "empty", 0.5)
             self.empty_click_cd = 0.45
 
     def throw_grenade(self, game):
@@ -660,7 +669,7 @@ class Player(GameObject):
             grenade = Grenade(self.x, self.y, self.angle)
             grenade.owner = self
             game.grenades.append(grenade)
-            soundbank.play("throw")
+            soundbank.emit(self, "throw")
         else:
             soundbank.play("error", 0.4)
             game.toast("Гранат нет — их роняют бомберы", color=(240, 150, 110))
@@ -684,7 +693,7 @@ class Player(GameObject):
         """Клавиша G: аптечка из расходников лечит на MEDKIT_HEAL."""
         if self.equipment.use_item("medkit"):
             self.heal(MEDKIT_HEAL)
-            soundbank.play("heal")
+            soundbank.emit(self, "heal")
         elif game is not None:
             soundbank.play("error", 0.4)
             game.toast("Аптечек нет", color=(240, 150, 110))
@@ -733,7 +742,7 @@ class Player(GameObject):
         amount *= self.boon_hurt_mult * self.skill_mod("damage_taken_mul", 1.0)
         self.hp -= amount
         self.hurt_timer = 0.35
-        soundbank.play("hurt")
+        soundbank.emit(self, "hurt")
         if game is not None:
             game.on_player_hurt(amount, self)
             if (melee is not None and melee.mod("retaliate_damage", 0.0)

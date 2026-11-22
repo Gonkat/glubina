@@ -203,7 +203,7 @@ class Dash(ActiveArtifact):
     def _power(self, owner, game):
         self.remaining = float(self.spec["distance"])
         owner.invuln_timer = max(getattr(owner, "invuln_timer", 0.0), 0.30)
-        soundbank.play("dash")
+        soundbank.emit(owner, "dash")
         return True
 
     def _tick(self, dt, owner, game):
@@ -239,7 +239,7 @@ class Nova(ActiveArtifact):
             )
         # визуал — переиспользуем Explosion (свет подхватит Game сам)
         game.effects.append(Explosion(owner.x, owner.y, radius))
-        soundbank.play("explosion", 0.6)   # волна тише настоящего взрыва
+        soundbank.emit(owner, "explosion", 0.6)   # волна тише настоящего взрыва
         return True
 
 
@@ -248,7 +248,7 @@ class Shield(ActiveArtifact):
 
     def _power(self, owner, game):
         owner.hurt_timer = max(owner.hurt_timer, self.spec["duration"])
-        soundbank.play("shield")
+        soundbank.emit(owner, "shield")
         return True
 
 
@@ -273,7 +273,7 @@ class Thunderlord(ActiveArtifact):
             game.damage_enemy(enemy, self.spec["damage"])
             game.effects.append(Lightning(owner.x, owner.y,
                                           enemy.x, enemy.y))
-        soundbank.play("lightning", 0.8)   # ОДИН раз на активацию, не на молнию
+        soundbank.emit(owner, "lightning", 0.8)   # ОДИН раз на активацию, не на молнию
         return True
 
 

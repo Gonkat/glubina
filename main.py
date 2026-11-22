@@ -7,6 +7,25 @@ import os
 import traceback
 
 
+def _raise_timer_resolution():
+    """Windows: системный таймер 1 мс вместо 15.6 мс.
+
+    SDL_Delay/pygame Clock спят по системному кванту: при 15.6 мс кадры
+    «дышат» даже при ровном FPS, и это видно как дрожание картинки у
+    гостя. Точный таймер даёт ровный шаг ~16.7 мс. Возвращает функцию
+    восстановления или None. Вне Windows и на ошибках — просто None.
+    """
+    try:
+        import ctypes
+
+        winmm = ctypes.WinDLL("winmm")
+        if winmm.timeBeginPeriod(1) != 0:
+            return None
+        return lambda: winmm.timeEndPeriod(1)
+    except (AttributeError, OSError):
+        return None
+
+
 def _report_startup_error(details):
     """Сохраняет ошибку запуска и показывает её на Windows."""
     root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -31,6 +50,7 @@ def _report_startup_error(details):
 
 
 def main():
+    restore_timer = _raise_timer_resolution()
     try:
         from game import Game
 
@@ -40,6 +60,9 @@ def main():
         details = traceback.format_exc()
         _report_startup_error(details)
         raise
+    finally:
+        if restore_timer is not None:
+            restore_timer()
 
 
 if __name__ == "__main__":

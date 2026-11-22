@@ -31,6 +31,7 @@ GOLD = (255, 208, 112)
 GREEN = (134, 226, 154)
 RED = (238, 110, 100)
 DIM = (144, 156, 178)
+PENDING = (214, 188, 120)      # «ждём ответа хоста», не истина
 
 
 # ------------------------------------------------------------ ОБРАБОТЧИКИ ПОКУПОК
@@ -158,6 +159,7 @@ class ShopUI:
         self.active_shop = None
         self.cursor = 0
         self.message = ""
+        self.message_color = None
         self.message_timer = 0.0
         self._last_tick = 0
         self.overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -168,6 +170,7 @@ class ShopUI:
         self.active_shop = shop
         self.cursor = 0
         self.message = ""
+        self.message_color = None
         self._last_tick = pygame.time.get_ticks()
 
     def _items(self, game):
@@ -206,9 +209,13 @@ class ShopUI:
             if session is not None and session.request_buy(
                     self.active_shop, self.cursor, offer.get("kind"),
                     offer.get("key")):
-                self.message = "Покупка отправлена хосту…"
+                # Оптимистичный отклик: строка сразу помечена «проверка»,
+                # но деньги/предмет не трогаем — истина у хоста.
+                self.message = "Отправлено хосту · ждём подтверждения"
+                self.message_color = PENDING
             else:
                 self.message = "Нет связи с хостом"
+                self.message_color = RED
             self.message_timer = 2.4
             return
         handler = BUY_HANDLERS.get(offer["kind"])
@@ -221,6 +228,24 @@ class ShopUI:
             # после покупки список мог измениться (улучшение/замена) — курсор
             # не должен «прыгнуть» на другой товар
             self.cursor = min(self.cursor, max(0, len(self._items(game)) - 1))
+
+    def notify_result(self, ok, text):
+        """Ответ хоста на отправленное намерение — прямо в окне магазина."""
+        self.message = text
+        self.message_color = GREEN if ok else RED
+        self.message_timer = 3.0
+
+    @staticmethod
+    def _pending_for(game, offer):
+        """Сколько намерений об этом же товаре ещё ждут ответа хоста."""
+        if getattr(game, "net_role", None) != "client":
+            return 0
+        session = getattr(game, "session", None)
+        counter = getattr(session, "pending_count", None)
+        if counter is None:
+            return 0
+        return counter("buy",
+                       f"{offer.get('kind') or ''}|{offer.get('key') or ''}")
 
     # ------------------------------------------------------------ ИКОНКИ
     @staticmethod
@@ -346,11 +371,14 @@ class ShopUI:
                   f"[{self.cursor + 1}/{len(items)}]")
         visuals.text(screen, footer, (panel.x + 26, panel.bottom - 46), 17, DIM)
         if self.message_timer > 0.0 and self.message:
-            success = not any(word in self.message for word in
-                              ("Не хватает", "уже", "предел", "Нет"))
+            color = self.message_color
+            if color is None:
+                success = not any(word in self.message for word in
+                                  ("Не хватает", "уже", "предел", "Нет"))
+                color = GREEN if success else RED
             visuals.text(screen, self.message,
                          (panel.centerx + 40, panel.bottom - 46), 18,
-                         GREEN if success else RED, align="center")
+                         color, align="center")
 
     def _draw_list(self, screen, game, items, rect):
         # нижние 94 px заняты сводкой «сейчас в руках» — строки не заезжают под неё
@@ -395,7 +423,15 @@ class ShopUI:
                 price_color = GOLD if affordable else (160, 100, 80)
                 visuals.text(screen, str(price), (row.right - 14, row.y + 10), 21,
                              price_color, align="right")
-                if not affordable:
+                pending = self._pending_for(game, offer)
+                if pending:
+                    # Временное локальное состояние: не покупка, а «запрос
+                    # ушёл». Цена и баланс остаются хостовыми.
+                    pygame.draw.rect(screen, PENDING, row, 1, border_radius=8)
+                    label = "проверка" if pending == 1 else f"проверка ×{pending}"
+                    visuals.text(screen, label, (row.right - 14, row.y + 30),
+                                 13, PENDING, align="right")
+                elif not affordable:
                     visuals.text(screen, f"не хватает {price - game.money - refund}",
                                  (row.right - 14, row.y + 30), 13, RED, align="right")
 

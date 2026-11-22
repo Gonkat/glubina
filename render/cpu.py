@@ -17,9 +17,13 @@ class CPUDisplay:
     vendor = ""
 
     def __init__(self, size: tuple[int, int] = (WIDTH, HEIGHT),
-                 metrics: FrameMetrics | None = None):
+                 metrics: FrameMetrics | None = None, vsync: bool = False):
         self.size = (int(size[0]), int(size[1]))
-        self.surface = pygame.display.set_mode(self.size)
+        # SDL требует OPENGL/SCALED для vsync; без них параметр игнорируется.
+        try:
+            self.surface = pygame.display.set_mode(self.size, vsync=1 if vsync else 0)
+        except pygame.error:
+            self.surface = pygame.display.set_mode(self.size)
         self.effects = False
         self.metrics = metrics
 

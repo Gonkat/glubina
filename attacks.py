@@ -53,12 +53,21 @@ class MeleeAttack:
             return
         self.cooldown = self.spec["cooldown"]
         self.attack_serial += 1
+        # Замах виден всем: хост рисует его по этому таймеру своим героям,
+        # гость — зеркалам (запускается звуковым событием). Урон считает
+        # только хост.
+        owner.melee_swing_timer = 0.22
+        owner.melee_swing_angle = owner.angle
         # «Мгновенный клинок»: удар после паузы. Серия запоминается на
         # весь замах, чтобы широкий удар не терял бонус на второй цели.
         self.first_strike_serial = (self.attack_serial
                                     if self.time_since_attack >= 1.0 else -1)
         self.time_since_attack = 0.0
-        soundbank.play("swing")      # звук есть у ВСЕХ атак: одна точка
+        if getattr(owner, "pid", 0):
+            # Замах игрока слышат и другие (в кооперативе — по расстоянию).
+            soundbank.emit(owner, "swing")
+        else:
+            soundbank.play("swing")  # звук есть у ВСЕХ атак: одна точка
         self._on_start(owner, game)  # (срабатывает только при реальном ударе)
 
     def _on_start(self, owner, game):

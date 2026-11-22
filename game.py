@@ -1,6 +1,7 @@
 """
 Главный класс игры: владеет всеми объектами и управляет циклом.
 """
+import gc
 import logging
 import math
 import os
@@ -37,7 +38,6 @@ from settings import (
     EXPLOSION_DAMAGE_PER_PX,
     EXPLOSION_MARK_TIME,
     EXPLOSION_SYNERGY,
-    FPS,
     HITSTOP_BIG,
     HITSTOP_KILL,
     SECTOR_TINTS,
@@ -96,6 +96,23 @@ from utils import circles_collide, distance, fade_draw, mix
 import visuals
 
 
+# Меню хоста, при которых онлайн-мир НЕ встаёт на паузу. Список намеренно
+# узкий: настройки/сложность могут пересоздавать окно, и останавливать
+# симуляцию на них безопаснее, чем гонять её во время смены vsync.
+COOP_LIVE_MENUS = (STATE_SHOP, STATE_TREE, STATE_PAUSED)
+
+# Хост — источник истины: его просадка тормозит всех гостей. Поэтому при
+# подключённых гостях хост сам снимает косметическую нагрузку, если его
+# кадр не укладывается в бюджет (порог с запасом от 60 FPS).
+HOST_PERF_BAD_MS = 18.5       # выше — копим «плохие» кадры
+HOST_PERF_GOOD_MS = 15.5      # ниже — считаем, что уже легко
+HOST_PERF_ON_AFTER = 0.6      # с, плохих кадров подряд
+HOST_PERF_OFF_AFTER = 3.0     # с, хороших кадров подряд
+HOST_PERF_LAMPS = 6           # сколько ламп освещает сцену в этом режиме
+HOST_PERF_FLASHES = 12        # сколько источников света всего
+HOST_EFFECT_CAP = 220         # сколько эффектов держим
+
+
 class Game:
     """Централизованное состояние раунда + игровой цикл."""
 
@@ -107,6 +124,9 @@ class Game:
         pygame.display.set_caption(TITLE)
         self.clock = pygame.time.Clock()
         pygame.mouse.set_visible(False)
+        # Спрайты грузим один раз на старте: в бою и на подключении кадр
+        # не должен платить за pygame.image.load / convert_alpha().
+        spritebank.preload()
 
         self.world = World()               # чанки генерируются по мере исследования
         self.camera = Camera()
@@ -127,6 +147,14 @@ class Game:
         self.coop_active = False
         self._online_actions = []
         self._online_input_timer = 0.0
+        # Звуки игроков: очередь на тик и антифлуд по (pid, звук).
+        self._sound_events = []
+        self._sound_last = {}
+        # Разовые эффекты (взрывы, удары врагов): их нельзя восстановить
+        # из снимков — событие живёт доли секунды.
+        self._net_events = []
+        # Одиночная игра по умолчанию: без затухания и без рассылки.
+        soundbank.bind_audio(None, None)
         # прозрачный слой для визуала атак ближнего боя (альфа-канал!)
         self.attack_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         # Полотно мира при снайперской оптике: больше окна, затем
@@ -182,6 +210,9 @@ class Game:
         self.render_players = self.players
         self.coop_active = False
         self.enemies = []
+        self._net_events = []
+        # Стабильные u32-номера сущностей для сети (id() в u32 не влезает).
+        self.net_ids = net_snapshot.EntityIds()
         self.enemy_shots = []   # снаряды дальних врагов (M12)
         self.enemy_index = EnemySpatialIndex()
         self.bullets = []
@@ -219,6 +250,15 @@ class Game:
         self.hitstop = 0.0
         self.recoil = 0.0
         self.damage_flash = 0.0
+        # Откуда прилетел урон (гость): направление и таймер подсказки.
+        self.hit_dir = 0.0
+        self.hit_dir_timer = 0.0
+        self._client_trigger = False
+        # Хост: авто-режим производительности (см. _update_host_perf).
+        self.host_perf = False
+        self.frame_ms = 0.0
+        self._perf_bad = 0.0
+        self._perf_good = 0.0
         self.hitmarker_timer = 0.0
         self.toast_text = ""
         self.toast_timer = 0.0
@@ -248,7 +288,9 @@ class Game:
     def run(self):
         running = True
         while running:
-            dt = min(self.clock.tick(FPS) / 1000.0, 0.05)  # защита от «скачка»
+            # Лимит кадров задаётся настройкой (0 — без ограничения).
+            dt = min(self.clock.tick(self.video.frame_rate()) / 1000.0, 0.05)
+            frame_started = time.perf_counter()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -402,16 +444,42 @@ class Game:
             elif self.state == STATE_PLAYING:
                 with metrics.measure("update"):
                     self.update(dt)
+            elif (self.net_role == "host" and self.coop_active
+                  and self.session is not None
+                  and self.state in COOP_LIVE_MENUS):
+                # Онлайн нельзя поставить на паузу: пока у хоста открыт
+                # магазин/доска/меню паузы, мир и сеть продолжают жить,
+                # а его герой стоит. Иначе у гостя замирает картинка на
+                # всё время окна, а потом его «дёргает» накопленными
+                # снимками.
+                with metrics.measure("update"):
+                    self.update(dt)
             elif (self.net_role == "client" and self.session is not None
                   and self.state in (STATE_PAUSED, STATE_SHOP, STATE_TREE,
-                                     STATE_DESCENT)):
+                                     STATE_DESCENT, STATE_SETTINGS,
+                                     STATE_DIFFICULTY, STATE_GAME_OVER)):
                 # Клиент не симулирует мир; даже с открытым окном он
                 # продолжает принимать снимки, иначе очередь сети росла бы.
                 with metrics.measure("update"):
                     self._client_pump_only(dt)
+            elif (self.net_role == "host" and self.coop_active
+                  and self.session is not None):
+                # Спуск/экран смерти: мир хоста стоит, но сеть обязана
+                # жить. Иначе у гостя замирает картинка на всё время
+                # экрана, а потом его «дёргает» пачкой снимков.
+                with metrics.measure("update"):
+                    self.session.pump(self, dt)
+                    for text, color, timer in self.session.drain_notices():
+                        self.toast(text, timer, tuple(color or (255, 220, 140)))
             with metrics.measure("draw"):
                 self.draw()
             self.video.present()
+            # Полное время кадра (включая презентацию): именно его p99
+            # показывает F3 — средний FPS прячет рывки.
+            frame_ms = (time.perf_counter() - frame_started) * 1000.0
+            metrics.add("frame", frame_ms)
+            # Сглаженное время кадра — вход для авто-режима хоста.
+            self.frame_ms = self.frame_ms * 0.94 + frame_ms * 0.06
         self.video.close()
         pygame.quit()
 
@@ -478,12 +546,13 @@ class Game:
         self.title_index = 0
 
     def _handle_settings_menu(self, key):
-        # 0 громкость, 1 рендер, 2 видеоадаптер, 3 GPU-эффекты
+        # 0 громкость, 1 рендер, 2 видеоадаптер, 3 GPU-эффекты,
+        # 4 лимит кадров, 5 вертикальная синхронизация
         if key in (pygame.K_UP, pygame.K_w):
-            self.settings_menu_index = (self.settings_menu_index - 1) % 4
+            self.settings_menu_index = (self.settings_menu_index - 1) % 6
             soundbank.play("ui_move")
         elif key in (pygame.K_DOWN, pygame.K_s):
-            self.settings_menu_index = (self.settings_menu_index + 1) % 4
+            self.settings_menu_index = (self.settings_menu_index + 1) % 6
             soundbank.play("ui_move")
         elif key in (pygame.K_LEFT, pygame.K_a):
             self._change_setting(-1)
@@ -508,12 +577,42 @@ class Game:
             self.video.cycle_adapter(step)
             self.settings_notice = self.video.notice
             return
-        enabled = not self.video.effects
-        self.video.set_effects(enabled)
+        if index == 3:
+            enabled = not self.video.effects
+            self.video.set_effects(enabled)
+            self.settings_notice = (
+                "GPU-эффекты включены." if enabled
+                else "GPU-эффекты выключены."
+            )
+            return
+        if index == 4:
+            cap = self.video.cycle_fps_cap(step)
+            self.settings_notice = (
+                "Лимит кадров: без ограничения." if not cap
+                else f"Лимит кадров: {cap} FPS."
+            )
+            return
+        enabled = not self.video.vsync
+        self.video.set_vsync(enabled)
+        self._rebind_display()
         self.settings_notice = (
-            "GPU-эффекты включены." if enabled
-            else "GPU-эффекты выключены."
+            "Вертикальная синхронизация включена." if enabled
+            else "Вертикальная синхронизация выключена."
         )
+
+    def _rebind_display(self):
+        """Окно пересоздано: всё, что привязано к Surface, — заново."""
+        previous = self.screen
+        try:
+            self.screen = self.video.surface
+        except Exception:
+            self.screen = previous
+            return
+        pygame.display.set_caption(TITLE)
+        pygame.mouse.set_visible(False)
+        self._world_layer = None
+        self.attack_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self._tints.clear()
 
     def _set_render_mode(self, mode):
         """Переключает presenter без сброса раунда и возвращает новый Surface."""
@@ -525,13 +624,8 @@ class Game:
             self.settings_notice = f"Не удалось переключить рендер: {exc}"
             self.screen = previous
             return
-        self.screen = self.video.surface
-        pygame.display.set_caption(TITLE)
-        pygame.mouse.set_visible(False)
-        # Слои привязаны к старому Surface; пересоздадим их лениво.
-        self._world_layer = None
-        self.attack_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        self._tints.clear()
+        # Слои привязаны к старому Surface; пересоздадим их заново.
+        self._rebind_display()
         if self.video.mode != self.video.requested_mode:
             self.settings_notice = self.video.notice or "OpenGL недоступен — оставлен CPU."
         elif self.video.mode == "opengl":
@@ -590,6 +684,7 @@ class Game:
             self.session.pump(self, dt)
             for text, color, timer in self.session.drain_notices():
                 self.toast(text, timer, tuple(color or (255, 220, 140)))
+            self._update_host_perf(dt)
         # камера живёт и во время «стопа кадра»: тряска должна доигрывать
         self.camera.update(dt)
         self._sync_camera_zoom()
@@ -634,11 +729,25 @@ class Game:
             for client in self.session.clients:
                 if client.player is not None:
                     self._apply_remote_input(client)
-        self.player.handle_input(
-            pygame.key.get_pressed(),
-            mouse_world,
-            pygame.mouse.get_pressed(),
-        )
+        if self.state == STATE_PLAYING and not getattr(
+                self, "server_authority", False):
+            self.player.handle_input(
+                pygame.key.get_pressed(),
+                mouse_world,
+                pygame.mouse.get_pressed(),
+            )
+        elif self.state == STATE_PLAYING:
+            # Выделенный сервер: клавиатуры нет, ввод приходит только от
+            # гостей (он уже применён выше).
+            pass
+        else:
+            # Меню хоста в онлайне не останавливает мир (см. COOP_LIVE_MENUS):
+            # герой стоит и не стреляет, а клавиши достаются интерфейсу.
+            self.player.move_dir = (0.0, 0.0)
+            self.player.trigger_held = False
+            self.player.melee_held = False
+            if self.player.firearm is not None:
+                self.player.cancel_charge()
         self._update_spectator_input()
         self.enemy_index.rebuild(self.enemies)
         for player in self.players:
@@ -711,6 +820,9 @@ class Game:
         self.bullets = [b for b in self.bullets if b.alive]
         self.enemy_shots = [s for s in self.enemy_shots if s.alive]
         self.effects = [e for e in self.effects if e.alive]
+        if self.host_perf and len(self.effects) > HOST_EFFECT_CAP:
+            # Гостям важнее ровный кадр хоста, чем сотая искра.
+            del self.effects[:len(self.effects) - HOST_EFFECT_CAP]
         self.grenades = [g for g in self.grenades if g.alive]
         self.drops = [d for d in self.drops if d.alive]
 
@@ -887,12 +999,12 @@ class Game:
         muzzle_angle = self.player.angle
         mx = player.x + math.cos(muzzle_angle) * (weapon.muzzle_offset - 6)
         my = player.y + math.sin(muzzle_angle) * (weapon.muzzle_offset - 6)
-        if random.random() < 0.75:
+        if random.random() < 0.75 and not self.host_perf:
             self.effects.append(Casing(mx, my, muzzle_angle))
 
     def spawn_dash_ghost(self, player):
         """След переката — частота ограничена, чтобы не пух список эффектов."""
-        if self._ghost_timer > 0.0:
+        if self.host_perf or self._ghost_timer > 0.0:
             return
         self._ghost_timer = 0.028
         self.effects.append(DashGhost(player.x, player.y, player.angle,
@@ -900,6 +1012,8 @@ class Game:
 
     def spawn_enemy_attack(self, enemy):
         """Красные искры в конце замаха: удар видно даже без звука."""
+        self.queue_net_event("enemy_attack", enemy.x, enemy.y, 0.0,
+                             (255, 110, 90))
         for _ in range(4):
             self.effects.append(Spark(enemy.x, enemy.y, enemy.angle,
                                       (255, 110, 90), 90))
@@ -918,6 +1032,18 @@ class Game:
             self.toast("Серия прервана", 1.4, color=(240, 140, 120))
         self.combo = 0
         self.combo_timer = 0.0
+        # Мир в онлайне не встаёт на паузу, поэтому удар по хосту в окне
+        # магазина/доски должен немедленно вернуть его в бой — иначе можно
+        # умереть, глядя в инвентарь.
+        if (self.net_role == "host" and self.coop_active
+                and self.state in (STATE_SHOP, STATE_TREE, STATE_PAUSED)):
+            if self.state == STATE_SHOP:
+                self.close_shop()
+            elif self.state == STATE_TREE:
+                self.close_tree()
+            else:
+                self.state = STATE_PLAYING
+            self.toast("Окно закрыто: атака", 1.8, color=(240, 160, 120))
 
     def on_player_death(self, player=None):
         """Фиксируем рекорд до показа экрана смерти."""
@@ -1561,6 +1687,9 @@ class Game:
         синергия с пробивным снарядом (см. _bullet_hit).
         """
         soundbank.play("explosion")
+        # Гостям нужен сам взрыв, а не только урон в HP: к следующему
+        # снимку эффект уже погас.
+        self.queue_net_event("explosion", x, y, radius, color)
         self.camera.add_shake(SHAKE_EXPLOSION)
         self.hitstop = max(self.hitstop, HITSTOP_BIG * 0.6)
         for enemy in self.nearby_enemies(x, y, radius):
@@ -1836,7 +1965,10 @@ class Game:
             for shop in self.shops
             if self.camera.is_visible(shop.x, shop.y, shop.light_radius)
         ]
-        for lamp in self.world.lamps_near(self.player.x, self.player.y, 1500):
+        lamps = self.world.lamps_near(self.player.x, self.player.y, 1500)
+        if self.host_perf:
+            lamps = lamps[:HOST_PERF_LAMPS]
+        for lamp in lamps:
             if self.camera.is_visible(lamp["x"], lamp["y"], lamp["radius"]):
                 sx, sy = self.camera.to_screen(lamp["x"], lamp["y"])
                 # Профиль мерцания общий с плафоном (zones.flicker) —
@@ -1855,12 +1987,22 @@ class Game:
                 pulse = 0.82 + 0.18 * math.sin(self.elapsed * 3.2 + bx * 0.01)
                 flashes.append((sx, sy, int(radius * pulse), color,
                                 None, (bx, by)))
-        for shot in self.enemy_shots:
-            if shot.light_radius and self.camera.is_visible(
-                    shot.x, shot.y, shot.light_radius):
-                sx, sy = self.camera.to_screen(shot.x, shot.y)
-                # Снаряд — движущийся свет: обрезку не кэшируем, свет мал.
-                flashes.append((sx, sy, shot.light_radius, shot.light_color))
+        if not self.host_perf:
+            for shot in self.enemy_shots:
+                if shot.light_radius and self.camera.is_visible(
+                        shot.x, shot.y, shot.light_radius):
+                    sx, sy = self.camera.to_screen(shot.x, shot.y)
+                    # Снаряд — движущийся свет: обрезку не кэшируем, свет мал.
+                    flashes.append((sx, sy, shot.light_radius,
+                                    shot.light_color))
+
+        if self.host_perf and len(flashes) > HOST_PERF_FLASHES:
+            # В тяжёлом режиме светят только ближайшие к герою источники:
+            # пересборка маски света — самая дорогая часть кадра хоста.
+            px, py = player_screen
+            flashes.sort(key=lambda item: (item[0] - px) ** 2
+                         + (item[1] - py) ** 2)
+            del flashes[HOST_PERF_FLASHES:]
 
         danger = 0.0
         if view.alive:
@@ -1945,6 +2087,9 @@ class Game:
             overlay.fill((0, 0, 0, 0))
             melee.draw(overlay, self.camera, view)
             world.blit(overlay, (0, 0))
+        # Замахи остальных героев: у чужих (и у своего на клиенте) нет
+        # локальной симуляции атаки, поэтому дугу рисуем по таймеру.
+        self._draw_swing_arcs(world, view)
 
         # Свой герой всегда яркий (он сам источник света), чужие —
         # проявляются по свету и видимости, как враги.
@@ -1993,11 +2138,47 @@ class Game:
             pygame.transform.scale(world, (WIDTH, HEIGHT), screen)
 
         if self.debug_visible:
+            # Гистограмма кадра вместо среднего FPS: среднее прячет рывки.
+            frame_stats = self.video.metrics.snapshot(
+                percentiles=(50.0, 95.0, 99.0)).get("frame", {})
+            slow = self.video.metrics.over_count("frame", 33.0)
+            frame_line = (
+                f"frame p50 {frame_stats.get('p50', 0.0):.1f}  "
+                f"p95 {frame_stats.get('p95', 0.0):.1f}  "
+                f"p99 {frame_stats.get('p99', 0.0):.1f}  "
+                f"max {frame_stats.get('max', 0.0):.1f} ms  "
+                f">33ms {slow}")
             lines = (f"FPS {self.clock.get_fps():.0f}  enemies {len(self.enemies)}  bullets {len(self.bullets)}",
+                     frame_line,
                      f"Seed {self.world.seed}  chunks {len(self.world._chunks)}  effects {len(self.effects)}",
                      f"Depth {self.depth}  zone {self.zone_key}  beacons {self.descent.active_count}/{len(self.descent.beacons)}"
                      f"  shots {len(self.enemy_shots)}",
                      f"Melee X: {self.active_cooldown:.1f}s   combo {self.combo}")
+            session = getattr(self, "session", None)
+            if session is not None:
+                net = getattr(session, "stats", {})
+                if self.net_role == "host":
+                    lines += (f"net {net.get('ticks', 0)} ticks  "
+                              f"build {net.get('build_ms', 0.0):.2f} ms  "
+                              f"out {net.get('bytes', 0)} B/tick  "
+                              f"perf {'on' if self.host_perf else 'off'}",)
+                elif self.net_role == "client" and self.client_view:
+                    view_stats = self.client_view.stats
+                    age = 0.0
+                    if getattr(session, "last_snapshot_at", 0.0):
+                        age = max(0.0, (time.monotonic()
+                                        - session.last_snapshot_at) * 1000.0)
+                    lines += (f"net snap {net.get('snapshots', 0)}  "
+                              f"rtt {getattr(session, 'rtt_ms', 0.0):.0f}  "
+                              f"jit {getattr(session, 'jitter_ms', 0.0):.0f} ms  "
+                              f"snap age {age:.0f} ms  "
+                              f"interp {self.client_view.interp_delay * 1000:.0f} ms",)
+                    lines += (f"pred err {self.client_view.predict_error:.0f} px  "
+                              f"timeline age {self.client_view.snapshot_age * 1000:.0f} ms  "
+                              f"hz {netplay.SNAPSHOT_HZ:.0f}/{netplay.INPUT_HZ:.0f}",)
+                    lines += (f"spawn {view_stats.get('spawns', 0)}  "
+                              f"despawn {view_stats.get('despawns', 0)}  "
+                              f"e {len(self.enemies)} b {len(self.bullets)}",)
             for index, line in enumerate(lines):
                 visuals.text(screen, line, (14, 14 + 22 * index), 20,
                              (255, 230, 130))
@@ -2013,6 +2194,8 @@ class Game:
                 self._tints[tint_index] = layer
             screen.blit(layer, (0, 0))
         self.hud.draw(screen, self)
+        if self.net_role == "client":
+            self._draw_hit_direction(screen)
         if self.coop_active:
             self._draw_player_tags(screen)
             self._draw_net_badge(screen)
@@ -2068,6 +2251,88 @@ class Game:
         if getattr(self, 'player', None) is not None:
             self.players = [self.player]
             self.remote_players = []
+        self._sound_events = []
+        self._sound_last.clear()
+        self._net_events = []
+        self._bind_audio()
+
+    # ------------------------------------------------------------ ЗВУК
+    def _audio_listener(self):
+        """Позиция «ушей» этого клиента: свой герой (или тот, за кем смотрим)."""
+        player = self.view_player()
+        if player is None:
+            return None
+        return float(player.x), float(player.y)
+
+    def _bind_audio(self):
+        """Позиционный звук: затухание у всех, рассылка — только у хоста."""
+        if not self.coop_active or self.net_role not in ('host', 'client'):
+            soundbank.bind_audio(None, None)
+            return
+        relay = self._queue_sound if self.net_role == 'host' else None
+        soundbank.bind_audio(self._audio_listener, relay)
+
+    def _queue_sound(self, pid, name, x, y, volume):
+        """Хост: звук игрока уходит гостям с БАЗОВОЙ громкостью.
+
+        Каждый гость сам считает затухание по расстоянию до своего героя.
+        Антифлуд по паре (игрок, звук): очередь не растёт от шквала
+        выстрелов, и один и тот же звук не дублируется на высоком FPS.
+        """
+        gap = soundbank.SOUND_MIN_GAP.get(name, 0.05)
+        now = float(self.elapsed)
+        key = (int(pid), name)
+        if now - self._sound_last.get(key, -1e9) < gap:
+            return
+        self._sound_last[key] = now
+        if len(self._sound_events) >= 32:
+            return
+        self._sound_events.append((int(pid), str(name), float(x), float(y),
+                                   float(volume)))
+
+    def take_sound_events(self):
+        """Забирает накопленные звуки (вызывает сетевой тик хоста)."""
+        events = self._sound_events
+        self._sound_events = []
+        return events
+
+    def queue_net_event(self, kind, x, y, size=0.0, color=None):
+        """Хост: разовый видимый эффект — в очередь сетевого тика."""
+        if self.net_role != "host" or self.session is None:
+            return
+        events = getattr(self, "_net_events", None)
+        if events is None:
+            events = self._net_events = []
+        if len(events) >= 24:
+            return
+        events.append((str(kind), float(x), float(y), float(size),
+                       tuple(color) if color else None))
+
+    def take_net_events(self):
+        events = getattr(self, "_net_events", None) or []
+        self._net_events = []
+        return events
+
+    def _play_remote_sounds(self, payload):
+        """Гость: играет звуки других игроков с затуханием по расстоянию."""
+        if getattr(self, '_warm_loading', False):
+            # Мир ещё не построен — слушать нечего.
+            return
+        items = payload.get('items') if isinstance(payload, dict) else None
+        if not items:
+            return
+        local_pid = int(getattr(self, 'local_pid', 0) or 0)
+        for pid, name, x, y, volume in items:
+            if name == 'swing' and self.client_view is not None:
+                # Замах ближнего боя приходит звуковым событием: клиент не
+                # симулирует атаки, но видеть чужой (и свой) удар должен.
+                self.client_view.present_swing(pid)
+            if int(pid) == local_pid:
+                # Свой звук — без панорамы и затухания: он «в голове».
+                soundbank.play(str(name), float(volume))
+            else:
+                soundbank.play_remote(str(name), float(x), float(y),
+                                      float(volume))
 
     def pump_online(self, dt):
         # Кадр экрана «Онлайн»: только сеть и отрисовка, мир не живёт.
@@ -2082,7 +2347,9 @@ class Game:
             for kind, payload in session.pump():
                 if kind == 'start':
                     self.start_coop_client(payload)
-                    return
+                    # Не выходим: в этой же пачке могут лежать spawn/progress
+                    # первого сектора — терять их нельзя.
+                    continue
                 if kind == 'notice':
                     self.toast(str(payload.get('text', '')),
                                float(payload.get('timer', 2.4)),
@@ -2102,35 +2369,63 @@ class Game:
         self.session.start_run(self)
         return True
 
-    def start_coop_run(self, clients):
+    def start_coop_run(self, clients, dedicated=False):
+        """Старт вылазки. ``dedicated`` — у сервера нет своего героя.
+
+        В host-based режиме первый герой — игрок-хост. У выделенного
+        сервера игрока нет: в мире только подключённые гости, а сам
+        процесс лишь симулирует и рассылает состояние.
+        """
         # Один seed на всех: клиенты построят тот же сектор сами.
-        self.local_pid = 1
+        self.local_pid = 1 if not dedicated else 0
         seed = random.SystemRandom().randrange(0, 2 ** 63)
         self.reset(seed=seed)
         self.net_role = 'host'
         self.coop_active = True
-        self.player.is_local = True
+        self.server_authority = bool(dedicated)
+        self.player.is_local = not dedicated
         self.player.name = self.local_name
-        start_x, start_y = self.world.player_start()
-        self.players = [self.player]
-        for index, client in enumerate(clients):
-            offset = 44.0 * ((index + 2) // 2)
-            side = 1.0 if index % 2 == 0 else -1.0
-            px, py = self.world.resolve_circle(
-                start_x + offset * side, start_y + offset * 0.5,
-                getattr(self.player, 'radius', 14))
-            player = Player(px, py)
-            player.pid = client.pid
-            player.is_local = False
-            player.name = client.name
+        if dedicated:
+            # Пустой список: герой процесса не участвует в бою и не
+            # попадает в снимок. Иначе у клиентов был бы "фантомный"
+            # союзник, на которого агрятся враги.
+            self.players = []
+            self.render_players = self.players
+        else:
+            self.players = [self.player]
+            self.render_players = self.players
+        for client in clients:
+            player = self.spawn_coop_player(client.pid, client.name)
             client.player = player
-            self.players.append(player)
+        if dedicated and self.players:
+            # Мир и камера сервера строятся вокруг первого живого гостя.
+            self.player = self.players[0]
         self.remote_players = [p for p in self.players if p is not self.player]
-        self.render_players = self.players
         self.state = STATE_PLAYING
+        self._bind_audio()
         self.toast(f'КООПЕРАТИВ · участников {len(self.players)}', 4.0,
                    color=(150, 226, 210))
         return self.seed, self.depth, self.zone_key
+
+    def spawn_coop_player(self, pid, name):
+        """Добавляет героя гостя в мир (старт вылазки или поздний вход)."""
+        start_x, start_y = self.world.player_start()
+        guests = [p for p in self.players
+                  if getattr(p, 'pid', 0) not in (0, 1)]
+        index = len(guests)
+        offset = 44.0 * ((index + 2) // 2)
+        side = 1.0 if index % 2 == 0 else -1.0
+        px, py = self.world.resolve_circle(
+            start_x + offset * side, start_y + offset * 0.5,
+            getattr(self.player, 'radius', 14))
+        player = Player(px, py)
+        player.pid = int(pid)
+        player.is_local = False
+        player.name = str(name)
+        self.players.append(player)
+        if player not in self.render_players:
+            self.render_players.append(player)
+        return player
 
     def start_coop_client(self, payload):
         # Клиент получает общий seed и строит тот же мир локально.
@@ -2144,7 +2439,13 @@ class Game:
         self.player.name = getattr(self.session, 'player_name', 'Гость')
         self.client_view = ClientView(self)
         self.client_view.local_pid = self.local_pid
+        # Свой герой — источник истины по позиции: хост принимает её из
+        # ввода и рассылает другим. Сверка с снимком отключается: она
+        # стоила кадров и давала "резинку" на пинге, а защита от
+        # подмены координат в кооперативе не приоритет.
+        self.client_view.local_authoritative = True
         self.state = STATE_PLAYING
+        self._bind_audio()
         self.toast('ПОДКЛЮЧЕНО · ждём снимок мира', 2.4,
                    color=(150, 226, 210))
 
@@ -2167,6 +2468,10 @@ class Game:
 
     # ------------------------------------------- КЛИЕНТ: МИР ПОРЦИЯМИ
     def _begin_client_warm(self, start_x, start_y):
+        self._warm_finished = False
+        # Долгоживущие объекты старта — в «вечную» генерацию: сборщик не
+        # обходит их каждый раз, паузы в кадрах загрузки короче (max — 25 мс
+        # вместо 38 мс на этой машине, замерено).
         """Очередь генерации чанков вокруг старта нового сектора.
 
         Клиенту мир нужен только для картинки и коллизий взгляда, поэтому
@@ -2184,26 +2489,71 @@ class Game:
         self._warm_queue = queue
         self._warm_total = len(queue)
         self._warm_loading = True
+        gc.collect()
+        gc.freeze()
 
     def _warm_client_world(self):
-        """Генерирует 1-2 чанка за кадр вместо одного длинного фриза."""
+        """Генерирует 1 чанк за кадр (бюджет 6 мс) вместо длинного фриза.
+
+        Полсекунды дольше грузимся — зато экран загрузки держит полный FPS
+        и ни одного кадра > 33 мс. По завершении — gc.collect + gc.freeze:
+        долгоживущие объекты старта больше не проверяются сборщиком.
+        """
         queue = getattr(self, "_warm_queue", None)
         if not queue:
             if getattr(self, "_warm_loading", False):
                 self._warm_loading = False
+                self._finish_client_warm()
             return
-        deadline = time.perf_counter() + 0.012
-        generated = 0
-        while queue and generated < 2:
+        deadline = time.perf_counter() + 0.006
+        while queue:
             chunk = queue.pop(0)
             if chunk in self.world._chunks:
                 continue
             self.world._generate_chunk(*chunk)
-            generated += 1
             if time.perf_counter() >= deadline:
                 break
         if not queue:
             self._warm_loading = False
+            self._finish_client_warm()
+
+    def _stream_client_chunks(self):
+        """Достраивает мир вокруг гостя по одному чанку за кадр.
+
+        Генерация чанка — ~14 мс: пачка из пяти дала бы рывок на 70 мс,
+        которого хост не видит. Поэтому здесь только пополняется очередь,
+        а работу с бюджетом кадра делает _warm_client_world. Если этого не
+        делать, чанки генерировались бы внутри draw именно в тот кадр,
+        когда герой подходит к краю построенного мира.
+        """
+        world = getattr(self, "world", None)
+        player = getattr(self, "player", None)
+        if world is None or player is None:
+            return
+        queue = getattr(self, "_warm_queue", None)
+        if queue is None:
+            queue = self._warm_queue = []
+        if len(queue) > 24:
+            return                  # запас уже есть
+        cx = math.floor(player.x / world.chunk_pixels)
+        cy = math.floor(player.y / world.chunk_pixels)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                key = (cx + dx, cy + dy)
+                if key in world._chunks or key in queue:
+                    continue
+                queue.append(key)
+
+    def _finish_client_warm(self):
+        """Загрузка сектора закончена: применяем первый снимок без пауз GC."""
+        if getattr(self, "_warm_finished", False):
+            return
+        self._warm_finished = True
+        gc.collect()
+        try:
+            gc.freeze()
+        except AttributeError:      # Python без gc.freeze — не ошибка
+            pass
 
     def _draw_world_sync(self, screen):
         screen.fill((8, 11, 17))
@@ -2225,14 +2575,66 @@ class Game:
                      (width // 2, y + 32), 16, (130, 150, 165),
                      align="center")
 
+    def _apply_net_events(self, items):
+        """Гость: разовые эффекты с хоста (взрывы, удары врагов).
+
+        Это ТОЛЬКО картинка: урон уже применён хостом и приедет в HP.
+        Радиус взрыва и цвет берём из события, частицы считаем сами.
+        """
+        player = self.view_player()
+        for entry in items:
+            try:
+                kind, x, y, size, color = entry
+            except (TypeError, ValueError):
+                continue
+            if kind == "explosion":
+                tint = tuple(color) if color else None
+                self.effects.append(Explosion(float(x), float(y),
+                                              float(size), color=tint))
+                if player is not None:
+                    dist = math.hypot(float(x) - player.x, float(y) - player.y)
+                    if dist < 900.0:
+                        self.camera.add_shake(6.0)
+                        soundbank.play_remote("explosion", float(x), float(y),
+                                              0.7)
+            elif kind == "enemy_attack":
+                tint = tuple(color) if color else (255, 110, 90)
+                for _ in range(4):
+                    self.effects.append(Spark(float(x), float(y),
+                                              random.uniform(0, math.tau),
+                                              tint, 90))
+
     def snapshot_payload(self):
         return net_snapshot.build(self)
+
+    def net_clock(self):
+        """Монотонные часы для датировки снимков.
+
+        ``elapsed`` — игровое время: оно замирает на hitstop и теряет
+        время при рывках кадра (dt clamp). По нему шкала снимков уезжала
+        от реального времени, и гость периодически переякоривал таймлайн
+        и получал «резинку». Сетевые метки должны идти по реальным часам.
+        """
+        return time.monotonic()
 
     def _pump_client_events(self):
         session = self.session
         if session is None:
             return
         for kind, payload in session.pump():
+            if kind == 'reconnecting':
+                # Связь пропала, но вылазка жива: сессия сама пробует
+                # вернуться в неё до RESUME_WINDOW секунд.
+                self.toast('СВЯЗЬ ПРЕРВАНА · переподключение…', 5.0,
+                           (240, 200, 120))
+                continue
+            if kind == 'resumed':
+                # Вернулись в ту же вылазку: зеркало и rev прогрессии — с нуля.
+                if self.client_view is not None:
+                    self.client_view.reset_mirrors()
+                soundbank.play('ui_confirm', 0.7)
+                self.toast('СВЯЗЬ ВОССТАНОВЛЕНА', 2.0, (150, 226, 190))
+                continue
             if kind == 'closed':
                 self.online_ui.screen = 'error'
                 self.online_ui.error = (session.error or payload or
@@ -2241,44 +2643,128 @@ class Game:
                 self.net_role = None
                 self.coop_active = False
                 self.client_view = None
+                self._bind_audio()
                 self.state = STATE_ONLINE
                 return
-            if kind == 'notice':
+            if kind in ('spawn', 'despawn', 'progress'):
+                # Репликация: дескрипторы/удаления/прогрессия идут отдельными
+                # событиями и не разбираются в пути снимка.
+                view = self.client_view
+                if view is None:
+                    continue
+                if kind == 'spawn':
+                    view.apply_spawn(payload)
+                elif kind == 'despawn':
+                    view.apply_despawn(payload)
+                else:
+                    view.apply_progress_message(payload)
+            elif kind == 'sounds':
+                # Звуки других игроков: позиция + базовая громкость,
+                # затухание считается здесь, по своему герою.
+                self._play_remote_sounds(payload)
+            elif kind == 'events':
+                self._apply_net_events(payload.get('items') or ())
+            elif kind == 'notice':
                 self.toast(str(payload.get('text', '')),
                            float(payload.get('timer', 2.4)),
                            tuple(payload.get('color') or (255, 220, 140)))
             elif kind == 'buy_result':
-                self.toast(str(payload.get('text', '')), 2.6,
-                           (140, 236, 170) if payload.get('ok')
-                           else (240, 140, 120))
+                # Ответ на намерение: подтверждение — зелёная плашка,
+                # отказ — красная. Состояние героя уже пришло снимком/
+                # progress от хоста, здесь только обратная связь.
+                ok = bool(payload.get('ok'))
+                text = str(payload.get('text', ''))
+                soundbank.play('buy' if ok else 'error', 0.7)
+                if self.state == STATE_SHOP:
+                    self.shop_ui.notify_result(ok, text)
+                elif self.state == STATE_TREE:
+                    self.skill_ui.notify_result(ok, text)
+                self.toast(text, 2.6,
+                           (140, 236, 170) if ok else (240, 140, 120))
+            elif kind == 'intent_timeout':
+                # Хост молчит или связь оборвалась. Повторять покупку
+                # автоматически нельзя: она могла уже примениться.
+                if payload.get('reason') == 'connection':
+                    text = 'Связь с хостом прервана — покупка не подтверждена'
+                else:
+                    text = 'Хост не ответил — покупка не подтверждена'
+                soundbank.play('error', 0.6)
+                self.toast(text, 3.0, (240, 190, 110))
             elif kind == 'error':
                 self.toast(str(payload), 3.0, (240, 140, 120))
 
     def _apply_snapshot(self):
         session = self.session
         view = self.client_view
-        if session is None or view is None or session.snapshot is None:
+        if session is None:
+            return
+        frames = session.take_snapshots()
+        if view is None or not frames:
+            return
+        if getattr(self, "_warm_loading", False):
+            # Первый снимок (и все до конца генерации) ждёт в сессии:
+            # применять его посреди стройки — значит рвать кадр загрузки.
+            # Очередь при этом не копим: старые кадры уже не нужны.
             return
         view.local_pid = self.local_pid
-        view.apply(session.snapshot)
+        # Все снимки, пришедшие с прошлого кадра: если хост рывком отправил
+        # пачку, интерполяция получит все точки, а не только последнюю.
+        for snap in frames:
+            view.apply(snap)
 
     def _client_update(self, dt):
         self.elapsed += dt
         # Красная вспышка урона — клиентская реакция, гасим её сами.
         self.damage_flash = max(0.0, self.damage_flash - dt * 3.0)
+        self.hit_dir_timer = max(0.0, self.hit_dir_timer - dt)
+        self.recoil = max(0.0, self.recoil - dt * 3.4)
         self.camera.update(dt)
         self._pump_client_events()
         if self.session is None:
             return
         self._apply_snapshot()
         if self.client_view is not None:
+            # Насколько позиция хоста в снимке отстаёт от «сейчас»: половина
+            # RTT плюс интервал снимков. По этой оценке расширяется мёртвая
+            # зона предсказания — иначе честный бег постоянно подтягивало
+            # бы назад и управление ощущалось вязким.
+            rtt = max(0.0, float(getattr(self.session, "rtt_ms", 0.0))) / 1000.0
+            # Снимок датирован моментом съёмки: половина RTT — насколько он
+            # старше момента прихода. Без этой оценки сверка предсказания
+            # отставала на пинг и тянула героя назад.
+            # Сглаживаем: одиночный всплеск RTT не должен сдвигать курсор
+            # интерполяции назад (это читалось бы как шаг чужого героя).
+            latency = min(0.2, rtt * 0.5)
+            current = getattr(self.client_view, "net_latency", 0.0)
+            self.client_view.net_latency = current + (latency - current) * 0.1
+            self.client_view.input_latency = (
+                rtt * 0.5 + 1.0 / netplay.SNAPSHOT_HZ)
+            # Предсказание ввода: свой герой идёт локально, без ступеньки
+            # между снимками.
+            if getattr(self.session, "status", "") == "playing":
+                self.client_view.set_local_input(*self._local_move_dir())
+                self.client_view.set_local_fire(pygame.mouse.get_pressed()[0])
+            else:
+                # Переподключение: герой стоит, а не убегает в стену.
+                self.client_view.set_local_input(0, 0)
+                self.client_view.set_local_fire(False)
             self.client_view.update(dt)
         self._warm_client_world()
+        self._stream_client_chunks()
+        # Точки интереса детерминированы по сиду: клиент обновляет их
+        # сам, а какие сундуки уже вскрыты — приходит снимком.
+        moved = self.player
+        if moved is not None:
+            self.exploration.update(moved.x, moved.y)
         self._sync_shops()
         self._update_spectator_input()
         view = self.view_player()
         if view is not None:
             self.camera.follow(view.x, view.y)
+        # Прицел — сразу по мыши, а не углом из снимка: снимок приходит
+        # 20 раз в секунду и на RTT позже, из-за чего ствол «плыл» за
+        # курсором. Хост всё равно проверяет выстрел.
+        self._aim_local_player(self.camera.to_world(*pygame.mouse.get_pos()))
         self._send_client_input(dt)
         self._sync_camera_zoom()
 
@@ -2286,13 +2772,22 @@ class Game:
         # Клиент с открытым окном (пауза/магазин) продолжает принимать снимки.
         self.elapsed += dt
         self.damage_flash = max(0.0, self.damage_flash - dt * 3.0)
+        self.hit_dir_timer = max(0.0, self.hit_dir_timer - dt)
+        self._client_trigger = False
         self._pump_client_events()
         if self.session is None:
             return
         self._apply_snapshot()
         if self.client_view is not None:
+            # Окно открыто (пауза/магазин): герой стоит на месте.
+            self.client_view.set_local_input(0, 0)
+            self.client_view.set_local_fire(False)
             self.client_view.update(dt)
         self._warm_client_world()
+        self._stream_client_chunks()
+        moved = self.player
+        if moved is not None:
+            self.exploration.update(moved.x, moved.y)
         self._sync_shops()
         self._update_spectator_input()
         view = self.view_player()
@@ -2301,35 +2796,73 @@ class Game:
         self.camera.update(dt)
         self._send_client_input(dt, idle_only=True)
 
+    def _aim_local_player(self, mouse_world):
+        """Клиент: свой герой смотрит в курсор СРАЗУ, без задержки снимка.
+
+        Направление влияет только на картинку и на то, что уйдёт хосту в
+        следующем вводе: урон, патроны и кулдауны остаются за хостом.
+        """
+        player = self.player
+        if player is None:
+            return
+        player.angle = math.atan2(mouse_world[1] - player.y,
+                                  mouse_world[0] - player.x)
+
     def _send_client_input(self, dt, idle_only=False):
         session = self.session
         if session is None or session.status != 'playing':
             return
         self._online_input_timer += dt
-        if self._online_input_timer < 1.0 / netplay.INPUT_HZ:
+        interval = 1.0 / netplay.INPUT_HZ
+        if self._online_input_timer < interval:
             return
-        self._online_input_timer = 0.0
+        # Вычитаем интервал, а не обнуляем таймер: при 144 FPS обнуление
+        # давало 48 Гц ввода вместо 60 и лишнюю ступеньку в поворотах.
+        self._online_input_timer = min(self._online_input_timer - interval,
+                                       interval)
         if idle_only or self.player is None or not self.player.alive:
             player = self.player
             session.send_input(
                 (0.0, 0.0),
                 player.angle if player else 0.0,
                 (player.x, player.y) if player else (0.0, 0.0),
-                False, False, [])
+                False, False, [],
+                position=(player.x, player.y) if player else None)
             self._online_actions.clear()
             return
+        dx, dy = self._local_move_dir()
+        mouse_world = self.camera.to_world(*pygame.mouse.get_pos())
+        angle = math.atan2(mouse_world[1] - self.player.y,
+                           mouse_world[0] - self.player.x)
+        buttons = pygame.mouse.get_pressed()
+        # Вспышка и гильза — в кадре нажатия. Пуля и урон всё равно придут
+        # от хоста, но выстрел перестаёт «залипать» на RTT.
+        if buttons[0] and not self._client_trigger \
+                and self.client_view is not None:
+            self.client_view.present_local_shot(self.player)
+        self._client_trigger = bool(buttons[0])
+        # Замах ближнего боя — тоже сразу по нажатию: хост подтвердит урон
+        # и кулдаун, но дуга не должна ждать RTT.
+        if buttons[2] and not getattr(self, "_client_melee", False) \
+                and self.client_view is not None:
+            self.client_view.present_local_melee(angle)
+        self._client_melee = bool(buttons[2])
+        actions, self._online_actions = self._online_actions, []
+        # Позиция — сразу за кадр, а не по подтверждению хоста: она же
+        # уезжает другим гостям снимком.
+        session.send_input((dx, dy), angle, mouse_world,
+                           buttons[0], buttons[2], actions,
+                           position=(self.player.x, self.player.y))
+
+    @staticmethod
+    def _local_move_dir():
+        """Текущее направление движения с клавиатуры (для ввода и прогноза)."""
         keys = pygame.key.get_pressed()
         dx = (1 if keys[pygame.K_d] or keys[pygame.K_RIGHT] else 0) - (
             1 if keys[pygame.K_a] or keys[pygame.K_LEFT] else 0)
         dy = (1 if keys[pygame.K_s] or keys[pygame.K_DOWN] else 0) - (
             1 if keys[pygame.K_w] or keys[pygame.K_UP] else 0)
-        mouse_world = self.camera.to_world(*pygame.mouse.get_pos())
-        angle = math.atan2(mouse_world[1] - self.player.y,
-                           mouse_world[0] - self.player.x)
-        buttons = pygame.mouse.get_pressed()
-        actions, self._online_actions = self._online_actions, []
-        session.send_input((dx, dy), angle, mouse_world,
-                           buttons[0], buttons[2], actions)
+        return dx, dy
 
     def _client_key(self, key):
         # Клиент превращает нажатия в НАМЕРЕНИЯ, а не в локальные действия.
@@ -2358,6 +2891,10 @@ class Game:
         action = actions.get(key)
         if action is not None:
             self._online_actions.append(action)
+            if action == 'dash' and self.client_view is not None:
+                # Рывок предсказываем сразу: иначе герой 100+ мс стоит,
+                # а потом хост «телепортирует» его на 120 px вперёд.
+                self.client_view.request_dash()
 
     def _apply_remote_input(self, client):
         player = client.player
@@ -2373,6 +2910,14 @@ class Game:
         player.move_dir = state['move']
         player.angle = state['aim']
         player.aim_pos = (state['aim_x'], state['aim_y'])
+        # Клиент — владелец позиции своего героя. Ставим её как есть и
+        # больше не интегрируем движение на хосте: меньше работы в кадре
+        # и ни одного отката у гостя.
+        position = state.get('pos')
+        if position is not None:
+            player.x = float(position[0])
+            player.y = float(position[1])
+            player.position_authoritative = True
         player.trigger_held = state['fire']
         player.melee_held = state['melee']
         for action in state['actions']:
@@ -2487,6 +3032,105 @@ class Game:
                     ratio, (126, 220, 150), (26, 30, 42))
         visuals.text(screen, "A / D — сменить", (rect.right - 26, rect.y + 46),
                      15, (170, 160, 196), align="right")
+
+    def _update_host_perf(self, dt):
+        """Хост сам решает, когда снять косметику ради ровного кадра.
+
+        Гости не симулируют, но видят мир глазами хоста: его просадка —
+        это рывки у всех. Режим включается по сглаженному времени кадра
+        (а не по среднему FPS) и только когда есть кого спасать.
+        """
+        clients = getattr(getattr(self, "session", None), "clients", ())
+        if not (self.coop_active and clients):
+            self.host_perf = False
+            self._perf_bad = 0.0
+            self._perf_good = 0.0
+            return
+        if self.frame_ms > HOST_PERF_BAD_MS:
+            self._perf_bad += dt
+            self._perf_good = 0.0
+        elif self.frame_ms < HOST_PERF_GOOD_MS:
+            self._perf_good += dt
+            self._perf_bad = 0.0
+        if self._perf_bad >= HOST_PERF_ON_AFTER:
+            self.host_perf = True
+        elif self._perf_good >= HOST_PERF_OFF_AFTER:
+            self.host_perf = False
+
+    def _draw_swing_arcs(self, world, view):
+        """Дуга замаха для героев, которых клиент не симулирует."""
+        swings = []
+        for player in self.players:
+            if player is view and self.net_role != "client":
+                # На хосте замах своего героя рисует сама атака. На клиенте
+                # локальных атак нет: свой удар рисуется по таймеру, иначе
+                # гость не видит собственный ближний бой вообще.
+                continue
+            if getattr(player, "melee_swing_timer", 0.0) <= 0.0:
+                continue
+            weapon = player.melee
+            if weapon is None:
+                continue
+            swings.append((player, weapon))
+        if not swings:
+            return
+        overlay = self._attack_layer_for(world.get_size())
+        overlay.fill((0, 0, 0, 0))
+        for player, weapon in swings:
+            spec = getattr(weapon, "spec", None) or {}
+            reach = float(spec.get("reach", 70.0)) * 0.9
+            half = math.radians(float(spec.get("arc_deg", 90.0))) / 2
+            color = tuple(spec.get("color") or (238, 226, 190))
+            if not self.camera.is_visible(player.x, player.y, reach + 40.0):
+                continue
+            timer = max(0.0, min(1.0, player.melee_swing_timer / 0.22))
+            progress = 1.0 - timer
+            angle = float(getattr(player, "melee_swing_angle", player.angle))
+            start = angle - half
+            blade = start + 2.0 * half * progress
+            cx, cy = self.camera.to_screen(player.x, player.y)
+            pts = [(cx, cy)]
+            steps = max(3, int(abs(blade - start) / 0.08))
+            for index in range(steps + 1):
+                arc = start + (blade - start) * index / steps
+                pts.append((cx + math.cos(arc) * reach,
+                            cy + math.sin(arc) * reach))
+            pygame.draw.polygon(overlay, (*color, int(56 + 96 * progress)),
+                                pts)
+            tip = (cx + math.cos(blade) * reach,
+                   cy + math.sin(blade) * reach)
+            pygame.draw.line(overlay, (*color, 210), (cx, cy), tip, 4)
+        world.blit(overlay, (0, 0))
+
+    def _draw_hit_direction(self, screen):
+        """Гость: красный сектор со стороны удара.
+
+        Урон считает хост, поэтому в момент потери HP клиент сам решает,
+        откуда он «пришёл»: ближайшая угроза. Так попадание читается как
+        удар с конкретной стороны, а не как потеря HP из ниоткуда.
+        """
+        timer = getattr(self, "hit_dir_timer", 0.0)
+        if timer <= 0.0:
+            return
+        player = self.view_player()
+        if player is None or not player.alive:
+            return
+        sx, sy = self.camera.to_screen(player.x, player.y)
+        angle = float(getattr(self, "hit_dir", 0.0))
+        alpha = min(1.0, timer / 0.35)
+        radius = float(getattr(player, "radius", 16.0)) + 30.0
+        half = 0.34
+        inner = 0.82
+        points = [
+            (sx + math.cos(angle - half * inner) * radius,
+             sy + math.sin(angle - half * inner) * radius),
+            (sx + math.cos(angle) * (radius + 16.0),
+             sy + math.sin(angle) * (radius + 16.0)),
+            (sx + math.cos(angle + half * inner) * radius,
+             sy + math.sin(angle + half * inner) * radius),
+        ]
+        color = (int(255 * alpha), int(96 * alpha), int(84 * alpha))
+        pygame.draw.lines(screen, color, False, points, 5)
 
     def _draw_player_tags(self, screen):
         for player in self.players:

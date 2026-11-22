@@ -75,7 +75,7 @@ class OpenGLPresenter:
     """Загружает готовый Surface в GPU-текстуру и рисует его на окне."""
 
     def __init__(self, size: tuple[int, int], effects: bool = True,
-                 metrics: FrameMetrics | None = None):
+                 metrics: FrameMetrics | None = None, vsync: bool = False):
         if GL is None or shaders is None:
             raise RuntimeError("PyOpenGL не установлен")
         self.size = (int(size[0]), int(size[1]))
@@ -89,7 +89,8 @@ class OpenGLPresenter:
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
         pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
         pygame.display.set_mode(
-            self.size, pygame.OPENGL | pygame.DOUBLEBUF
+            self.size, pygame.OPENGL | pygame.DOUBLEBUF,
+            vsync=1 if vsync else 0,
         )
 
         self.name = _gl_string(GL.GL_RENDERER) or "OpenGL"

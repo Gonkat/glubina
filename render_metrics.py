@@ -49,6 +49,13 @@ class FrameMetrics:
     def reset(self) -> None:
         self._samples.clear()
 
+    def over_count(self, section: str, threshold: float) -> int:
+        """Сколько замеров секции длиннее порога (кадры > 33 мс)."""
+        samples = self._samples.get(section)
+        if not samples:
+            return 0
+        return sum(1 for value in samples if value > threshold)
+
     def sections(self) -> list[str]:
         return sorted(self._samples)
 

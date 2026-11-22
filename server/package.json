@@ -1,0 +1,14 @@
+{
+  "name": "glubina-dedicated",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dedicated server for GLUBINA co-op: session gateway + headless game authority",
+  "main": "dedicated.js",
+  "scripts": {
+    "start": "node dedicated.js",
+    "start:lan": "node dedicated.js --bind 0.0.0.0 --port 32123"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
